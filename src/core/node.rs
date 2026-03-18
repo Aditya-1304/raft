@@ -93,7 +93,7 @@ where
     }
   }
 
-  pub fn id(self) -> NodeId {
+  pub fn id(&self) -> NodeId {
     self.id
   } 
 

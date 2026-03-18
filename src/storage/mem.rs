@@ -132,7 +132,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C,S> {
     }
 
     let first_new_index = entries[0].index;
-    let expected_next = self.last_log_index();
+    let expected_next = self.last_log_index() + 1;
 
 
     if first_new_index > expected_next {

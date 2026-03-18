@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub type NodeId = u64;
 pub type Term = u64;
 pub type LogIndex = u64;
@@ -46,4 +48,9 @@ impl Default for SoftState {
 pub struct Progress {
   pub next_index: LogIndex,
   pub match_index: LogIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LeaderState {
+  pub progress: HashMap<NodeId, Progress>
 }

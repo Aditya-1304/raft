@@ -3,6 +3,7 @@ pub mod entry;
 pub mod message;
 pub mod traits;
 pub mod storage;
+pub mod sm;
 
 fn main() {
     println!("Hello, world!");

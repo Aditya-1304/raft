@@ -53,3 +53,10 @@ pub struct Progress {
 pub struct LeaderState {
     pub progress: HashMap<NodeId, Progress>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot<S> {
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    pub data: S,
+}

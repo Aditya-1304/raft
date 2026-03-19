@@ -165,6 +165,10 @@ where
             }
         };
 
+        if response.success {
+            self.maybe_advance_commit();
+        }
+
         if should_send_more {
             self.send_append_entries_to(from);
         }
@@ -269,17 +273,11 @@ where
     }
 
     fn follow_leader_commit(&mut self, leader_commit: LogIndex) {
-        let new_commit = leader_commit.min(self.last_log_index());
-
-        if new_commit <= self.commit_index {
+        if leader_commit <= self.commit_index {
             return;
         }
 
-        self.commit_index = new_commit;
-
-        let mut hs = self.stable.hard_state();
-        hs.commit = new_commit;
-        self.set_hard_state(hs);
+        self.commit_to(leader_commit);
     }
 
     fn backtrack_next_index(&self, response: &AppendEntriesResponse) -> Option<LogIndex> {

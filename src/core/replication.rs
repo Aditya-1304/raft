@@ -45,6 +45,56 @@ where
         }
     }
 
+    pub(crate) fn broadcast_append_entries(&mut self) {
+        let peers: Vec<NodeId> = self
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| *peer != self.id)
+            .collect();
+
+        for peer in peers {
+            self.send_append_entries_to(peer);
+        }
+    }
+
+    pub(crate) fn send_append_entries_to(&mut self, to: NodeId) {
+        if self.soft_state.role != Role::Leader {
+            return;
+        }
+
+        let Some(next_index) = self
+            .leader_state
+            .as_ref()
+            .and_then(|leader| leader.progress.get(&to))
+            .map(|progress| progress.next_index)
+        else {
+            return;
+        };
+
+        let prev_log_index = next_index.saturating_sub(1);
+        let prev_log_term = if prev_log_index == 0 {
+            0
+        } else {
+            self.log.term(prev_log_index).unwrap_or(0)
+        };
+
+        let request = AppendEntriesRequest {
+            term: self.current_term(),
+            leader_id: self.id,
+            prev_log_index,
+            prev_log_term,
+            entries: self.log.entries(next_index, usize::MAX),
+            leader_commit: self.commit_index,
+        };
+
+        self.outbox.push(Envelope {
+            from: self.id,
+            to,
+            msg: Message::AppendEntries(request),
+        });
+    }
+
     pub(crate) fn handle_append_entries_request(
         &mut self,
         from: NodeId,
@@ -74,6 +124,44 @@ where
         if response.term > self.current_term() {
             self.become_follower(response.term, None);
         }
+    }
+
+    pub(crate) fn handle_append_entries_response_from(
+        &mut self,
+        from: NodeId,
+        response: AppendEntriesResponse,
+    ) {
+        if response.term > self.current_term() {
+            self.become_follower(response.term, None);
+            return;
+        }
+
+        if self.soft_state.role != Role::Leader {
+            return;
+        }
+
+        let matched_up_to = self.last_log_index();
+        let retry_next = self.backtrack_next_index(&response);
+
+        {
+            let Some(leader_state) = self.leader_state.as_mut() else {
+                return;
+            };
+
+            let Some(progress) = leader_state.progress.get_mut(&from) else {
+                return;
+            };
+
+            if response.success {
+                progress.match_index = matched_up_to;
+                progress.next_index = progress.match_index + 1;
+                return;
+            }
+
+            let fallback_next = progress.next_index.saturating_sub(1).max(1);
+            progress.next_index = retry_next.unwrap_or(fallback_next).max(1);
+        }
+        self.send_append_entries_to(from);
     }
 
     fn accept_append_entries(&mut self, to: NodeId) {
@@ -184,5 +272,28 @@ where
         let mut hs = self.stable.hard_state();
         hs.commit = new_commit;
         self.set_hard_state(hs);
+    }
+
+    fn backtrack_next_index(&self, response: &AppendEntriesResponse) -> Option<LogIndex> {
+        if let Some(conflict_term) = response.conflict_term {
+            if let Some(last_index) = self.last_index_of_term(conflict_term) {
+                return Some(last_index + 1);
+            }
+        }
+
+        response.conflict_index
+    }
+
+    fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        let first_visible = self.log.first_index().saturating_sub(1);
+        let mut index = self.last_log_index();
+
+        while index > first_visible {
+            match self.log.term(index) {
+                Some(found_term) if found_term == term => return Some(index),
+                _ => index -= 1,
+            }
+        }
+        None
     }
 }

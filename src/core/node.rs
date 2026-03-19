@@ -3,10 +3,15 @@ use std::collections::HashSet;
 use crate::{
     core::ready::Ready,
     entry::LogEntry,
-    message::Envelope,
+    message::{AppendEntriesRequest, Envelope, Message},
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{HardState, LeaderState, LogIndex, NodeId, Role, SoftState, Term},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum ProposeError {
+    NotLeader,
+}
 
 #[derive(Debug)]
 pub struct RaftNode<C, LS, SS>
@@ -78,6 +83,46 @@ where
             pending_entries: Vec::new(),
             soft_state_changed: false,
         }
+    }
+
+    pub fn propose(&mut self, cmd: C) -> Result<LogIndex, ProposeError> {
+        if self.soft_state.role != Role::Leader {
+            return Err(ProposeError::NotLeader);
+        }
+
+        let entry = LogEntry {
+            index: self.last_log_index() + 1,
+            term: self.current_term(),
+            command: cmd,
+        };
+
+        let prev_log_index = entry.index.saturating_sub(1);
+        let prev_log_term = if prev_log_index == 0 {
+            0
+        } else {
+            self.log.term(prev_log_index).unwrap_or(0)
+        };
+
+        self.log.append(std::slice::from_ref(&entry));
+        self.pending_entries.push(entry.clone());
+
+        let request = AppendEntriesRequest {
+            term: self.current_term(),
+            leader_id: self.id,
+            prev_log_index,
+            prev_log_term,
+            entries: vec![entry.clone()],
+            leader_commit: self.commit_index,
+        };
+
+        for peer in self.peers.iter().copied().filter(|peer| *peer != self.id) {
+            self.outbox.push(Envelope {
+                from: self.id,
+                to: peer,
+                msg: Message::AppendEntries(request.clone()),
+            });
+        }
+        Ok(entry.index)
     }
 
     pub fn ready(&mut self) -> Ready<C> {

@@ -18,6 +18,7 @@ where
         match self.soft_state.role {
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(ticks);
+                self.maybe_send_heartbeats();
             }
             Role::Follower | Role::Candidate => {
                 self.election_elapsed = self.election_elapsed.saturating_add(ticks);
@@ -42,14 +43,10 @@ where
                 self.handle_request_vote_response(from, response)
             }
             Message::AppendEntries(request) => {
-                if request.term >= self.current_term() {
-                    self.become_follower(request.term, Some(request.leader_id));
-                }
+                self.handle_append_entries_request(from, request);
             }
             Message::AppendEntriesResponse(response) => {
-                if response.term > self.current_term() {
-                    self.become_follower(response.term, None);
-                }
+                self.handle_append_entries_response(response);
             }
         }
     }
@@ -164,6 +161,7 @@ where
         self.votes_received.clear();
         self.reset_election_timer();
         self.reset_heartbeat_timer();
+        self.broadcast_heartbeats();
     }
 
     fn quorum_size(&self) -> usize {

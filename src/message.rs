@@ -31,6 +31,7 @@ pub struct AppendEntriesRequest<C> {
 pub struct AppendEntriesResponse {
     pub term: Term,
     pub success: bool,
+    pub match_index: Option<LogIndex>,
     pub conflict_term: Option<Term>,
     pub conflict_index: Option<LogIndex>,
 }

@@ -106,7 +106,7 @@ where
         }
 
         self.become_follower(request.term, Some(request.leader_id));
-        self.reset_heartbeat_timer();
+        self.reset_election_timer();
 
         if let Err((conflict_term, conflict_index)) =
             self.check_prev_log_match(request.prev_log_index, request.prev_log_term)
@@ -117,13 +117,9 @@ where
 
         self.append_from_leader(&request.entries);
         self.follow_leader_commit(request.leader_commit);
-        self.accept_append_entries(from);
-    }
 
-    pub(crate) fn handle_append_entries_response(&mut self, response: AppendEntriesResponse) {
-        if response.term > self.current_term() {
-            self.become_follower(response.term, None);
-        }
+        let matched_index = request.prev_log_index + request.entries.len() as LogIndex;
+        self.accept_append_entries(from, matched_index);
     }
 
     pub(crate) fn handle_append_entries_response_from(
@@ -136,14 +132,18 @@ where
             return;
         }
 
+        if response.term < self.current_term() {
+            return;
+        }
+
         if self.soft_state.role != Role::Leader {
             return;
         }
 
-        let matched_up_to = self.last_log_index();
+        let leader_last_index = self.last_log_index();
         let retry_next = self.backtrack_next_index(&response);
 
-        {
+        let should_send_more = {
             let Some(leader_state) = self.leader_state.as_mut() else {
                 return;
             };
@@ -153,24 +153,31 @@ where
             };
 
             if response.success {
-                progress.match_index = matched_up_to;
-                progress.next_index = progress.match_index + 1;
-                return;
+                let acknowledged = response.match_index.unwrap_or(progress.match_index);
+                progress.match_index = progress.match_index.max(acknowledged);
+                progress.next_index = progress.next_index.max(progress.match_index + 1);
+                progress.next_index <= leader_last_index
+            } else {
+                let fallback_next = progress.next_index.saturating_sub(1).max(1);
+                let candidate_next = retry_next.unwrap_or(fallback_next).max(1);
+                progress.next_index = progress.next_index.min(candidate_next);
+                true
             }
+        };
 
-            let fallback_next = progress.next_index.saturating_sub(1).max(1);
-            progress.next_index = retry_next.unwrap_or(fallback_next).max(1);
+        if should_send_more {
+            self.send_append_entries_to(from);
         }
-        self.send_append_entries_to(from);
     }
 
-    fn accept_append_entries(&mut self, to: NodeId) {
+    fn accept_append_entries(&mut self, to: NodeId, match_index: LogIndex) {
         self.outbox.push(Envelope {
             from: self.id,
             to,
             msg: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term(),
                 success: true,
+                match_index: Some(match_index),
                 conflict_term: None,
                 conflict_index: None,
             }),
@@ -189,6 +196,7 @@ where
             msg: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term(),
                 success: false,
+                match_index: None,
                 conflict_term,
                 conflict_index: Some(conflict_index),
             }),
@@ -294,6 +302,7 @@ where
                 _ => index -= 1,
             }
         }
+
         None
     }
 }

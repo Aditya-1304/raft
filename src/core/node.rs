@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::{
     core::ready::Ready,
     entry::LogEntry,
-    message::{AppendEntriesRequest, Envelope, Message},
+    message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{HardState, LeaderState, LogIndex, NodeId, Role, SoftState, Term},
 };
@@ -96,32 +96,11 @@ where
             command: cmd,
         };
 
-        let prev_log_index = entry.index.saturating_sub(1);
-        let prev_log_term = if prev_log_index == 0 {
-            0
-        } else {
-            self.log.term(prev_log_index).unwrap_or(0)
-        };
-
         self.log.append(std::slice::from_ref(&entry));
         self.pending_entries.push(entry.clone());
 
-        let request = AppendEntriesRequest {
-            term: self.current_term(),
-            leader_id: self.id,
-            prev_log_index,
-            prev_log_term,
-            entries: vec![entry.clone()],
-            leader_commit: self.commit_index,
-        };
+        self.broadcast_append_entries();
 
-        for peer in self.peers.iter().copied().filter(|peer| *peer != self.id) {
-            self.outbox.push(Envelope {
-                from: self.id,
-                to: peer,
-                msg: Message::AppendEntries(request.clone()),
-            });
-        }
         Ok(entry.index)
     }
 

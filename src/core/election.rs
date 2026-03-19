@@ -46,7 +46,7 @@ where
                 self.handle_append_entries_request(from, request);
             }
             Message::AppendEntriesResponse(response) => {
-                self.handle_append_entries_response(response);
+                self.handle_append_entries_response_from(from, response);
             }
         }
     }

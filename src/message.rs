@@ -4,6 +4,20 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreVoteRequest {
+    pub term: Term,
+    pub candidate_id: NodeId,
+    pub last_log_index: LogIndex,
+    pub last_log_term: Term,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreVoteResponse {
+    pub term: Term,
+    pub vote_granted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestVoteRequest {
     pub term: Term,
     pub candidate_id: NodeId,
@@ -52,6 +66,8 @@ pub struct InstallSnapshotResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message<C, S> {
+    PreVote(PreVoteRequest),
+    PreVoteResponse(PreVoteResponse),
     RequestVote(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntriesRequest<C>),

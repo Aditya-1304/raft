@@ -95,6 +95,64 @@ fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, TestSnap>> {
     node.ready().messages
 }
 
+fn tick_to_timeout(node: &mut TestNode) {
+    let timeout = node.current_election_timeout();
+    node.tick(timeout);
+}
+
+fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, TestSnap>>) {
+    for msg in messages {
+        let idx = (msg.to - 1) as usize;
+        nodes[idx].step(msg);
+    }
+}
+
+fn elect_leader(nodes: &mut [TestNode; 3], leader_idx: usize) {
+    tick_to_timeout(&mut nodes[leader_idx]);
+
+    let prevotes = take_messages(&mut nodes[leader_idx]);
+    assert_eq!(prevotes.len(), 2);
+    for msg in &prevotes {
+        assert!(matches!(msg.msg, Message::PreVote(_)));
+    }
+    deliver(nodes, prevotes);
+
+    let mut prevote_responses = Vec::new();
+    for idx in 0..nodes.len() {
+        if idx != leader_idx {
+            prevote_responses.extend(take_messages(&mut nodes[idx]));
+        }
+    }
+
+    assert_eq!(prevote_responses.len(), 2);
+    for msg in &prevote_responses {
+        assert!(matches!(msg.msg, Message::PreVoteResponse(_)));
+    }
+    deliver(nodes, prevote_responses);
+
+    let vote_requests = take_messages(&mut nodes[leader_idx]);
+    assert_eq!(vote_requests.len(), 2);
+    for msg in &vote_requests {
+        assert!(matches!(msg.msg, Message::RequestVote(_)));
+    }
+    deliver(nodes, vote_requests);
+
+    let mut vote_responses = Vec::new();
+    for idx in 0..nodes.len() {
+        if idx != leader_idx {
+            vote_responses.extend(take_messages(&mut nodes[idx]));
+        }
+    }
+
+    assert_eq!(vote_responses.len(), 2);
+    for msg in &vote_responses {
+        assert!(matches!(msg.msg, Message::RequestVoteResponse(_)));
+    }
+    deliver(nodes, vote_responses);
+
+    assert_eq!(nodes[leader_idx].role(), &Role::Leader);
+}
+
 #[test]
 fn mem_log_compaction_retains_boundary_term_and_visible_suffix() {
     let mut store = MemStorage::<TestCmd, TestSnap>::new();
@@ -261,27 +319,7 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
     assert_eq!(nodes[0].first_log_index(), 3);
     assert_eq!(nodes[0].last_log_index(), 3);
 
-    nodes[0].tick(ELECTION_TIMEOUT);
-    let vote_requests = take_messages(&mut nodes[0]);
-    assert_eq!(vote_requests.len(), 2);
-
-    for msg in vote_requests {
-        match msg.to {
-            2 => nodes[1].step(msg),
-            3 => nodes[2].step(msg),
-            _ => unreachable!(),
-        }
-    }
-
-    let mut vote_responses = Vec::new();
-    vote_responses.extend(take_messages(&mut nodes[1]));
-    vote_responses.extend(take_messages(&mut nodes[2]));
-
-    for msg in vote_responses {
-        nodes[0].step(msg);
-    }
-
-    assert_eq!(nodes[0].role(), &Role::Leader);
+    elect_leader(&mut nodes, 0);
 
     let leader_ready = take_ready(&mut nodes[0]);
     let to_follower_2: Vec<_> = leader_ready

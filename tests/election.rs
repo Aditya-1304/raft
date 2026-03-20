@@ -29,6 +29,34 @@ fn tick_to_timeout(node: &mut TestNode) {
     node.tick(timeout);
 }
 
+fn assert_all_prevote(messages: &[Envelope<(), ()>], candidate_id: u64, term: u64) {
+    for msg in messages {
+        match &msg.msg {
+            Message::PreVote(req) => {
+                assert_eq!(req.term, term);
+                assert_eq!(req.candidate_id, candidate_id);
+                assert_eq!(req.last_log_index, 0);
+                assert_eq!(req.last_log_term, 0);
+            }
+            _ => panic!("expected PreVote"),
+        }
+    }
+}
+
+fn assert_all_request_vote(messages: &[Envelope<(), ()>], candidate_id: u64, term: u64) {
+    for msg in messages {
+        match &msg.msg {
+            Message::RequestVote(req) => {
+                assert_eq!(req.term, term);
+                assert_eq!(req.candidate_id, candidate_id);
+                assert_eq!(req.last_log_index, 0);
+                assert_eq!(req.last_log_term, 0);
+            }
+            _ => panic!("expected RequestVote"),
+        }
+    }
+}
+
 #[test]
 fn one_leader_is_elected() {
     let mut n1 = new_node(1, vec![2, 3], 5);
@@ -36,12 +64,14 @@ fn one_leader_is_elected() {
     let mut n3 = new_node(3, vec![1, 2], 5);
 
     tick_to_timeout(&mut n1);
-    let requests = take_messages(&mut n1);
+    let prevotes = take_messages(&mut n1);
 
     assert_eq!(n1.role(), &Role::Candidate);
-    assert_eq!(requests.len(), 2);
+    assert_eq!(n1.current_term(), 0);
+    assert_eq!(prevotes.len(), 2);
+    assert_all_prevote(&prevotes, 1, 1);
 
-    for msg in requests {
+    for msg in prevotes {
         match msg.to {
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -49,11 +79,42 @@ fn one_leader_is_elected() {
         }
     }
 
-    let mut responses = Vec::new();
-    responses.extend(take_messages(&mut n2));
-    responses.extend(take_messages(&mut n3));
+    let mut prevote_responses = Vec::new();
+    prevote_responses.extend(take_messages(&mut n2));
+    prevote_responses.extend(take_messages(&mut n3));
 
-    for msg in responses {
+    for msg in &prevote_responses {
+        match &msg.msg {
+            Message::PreVoteResponse(resp) => {
+                assert!(resp.vote_granted);
+                assert_eq!(resp.term, 0);
+            }
+            _ => panic!("expected PreVoteResponse"),
+        }
+    }
+
+    for msg in prevote_responses {
+        n1.step(msg);
+    }
+
+    let vote_requests = take_messages(&mut n1);
+    assert_eq!(n1.current_term(), 1);
+    assert_eq!(vote_requests.len(), 2);
+    assert_all_request_vote(&vote_requests, 1, 1);
+
+    for msg in vote_requests {
+        match msg.to {
+            2 => n2.step(msg),
+            3 => n3.step(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut vote_responses = Vec::new();
+    vote_responses.extend(take_messages(&mut n2));
+    vote_responses.extend(take_messages(&mut n3));
+
+    for msg in vote_responses {
         n1.step(msg);
     }
 
@@ -107,23 +168,90 @@ fn split_vote_eventually_resolves() {
     tick_to_timeout(&mut n1);
     tick_to_timeout(&mut n2);
 
-    let requests_1 = take_messages(&mut n1);
-    let requests_2 = take_messages(&mut n2);
+    let prevotes_1 = take_messages(&mut n1);
+    let prevotes_2 = take_messages(&mut n2);
 
-    let mut delayed = Vec::new();
+    assert_all_prevote(&prevotes_1, 1, 1);
+    assert_all_prevote(&prevotes_2, 2, 1);
 
-    for msg in requests_1 {
+    let mut delayed_prevotes = Vec::new();
+
+    for msg in prevotes_1 {
         match msg.to {
             3 => n3.step(msg),
-            2 | 4 => delayed.push(msg),
+            2 | 4 => delayed_prevotes.push(msg),
             _ => unreachable!(),
         }
     }
 
-    for msg in requests_2 {
+    for msg in prevotes_2 {
         match msg.to {
             4 => n4.step(msg),
-            1 | 3 => delayed.push(msg),
+            1 | 3 => delayed_prevotes.push(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    for msg in take_messages(&mut n3) {
+        n1.step(msg);
+    }
+    for msg in take_messages(&mut n4) {
+        n2.step(msg);
+    }
+
+    assert_eq!(n1.current_term(), 0);
+    assert_eq!(n2.current_term(), 0);
+    assert_ne!(n1.role(), &Role::Leader);
+    assert_ne!(n2.role(), &Role::Leader);
+
+    for msg in delayed_prevotes {
+        match msg.to {
+            1 => n1.step(msg),
+            2 => n2.step(msg),
+            3 => n3.step(msg),
+            4 => n4.step(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut prevote_responses = Vec::new();
+    prevote_responses.extend(take_messages(&mut n1));
+    prevote_responses.extend(take_messages(&mut n2));
+    prevote_responses.extend(take_messages(&mut n3));
+    prevote_responses.extend(take_messages(&mut n4));
+
+    for msg in prevote_responses {
+        match msg.to {
+            1 => n1.step(msg),
+            2 => n2.step(msg),
+            3 => n3.step(msg),
+            4 => n4.step(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    let vote_requests_1 = take_messages(&mut n1);
+    let vote_requests_2 = take_messages(&mut n2);
+
+    assert_eq!(n1.current_term(), 1);
+    assert_eq!(n2.current_term(), 1);
+    assert_all_request_vote(&vote_requests_1, 1, 1);
+    assert_all_request_vote(&vote_requests_2, 2, 1);
+
+    let mut delayed_votes = Vec::new();
+
+    for msg in vote_requests_1 {
+        match msg.to {
+            3 => n3.step(msg),
+            2 | 4 => delayed_votes.push(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    for msg in vote_requests_2 {
+        match msg.to {
+            4 => n4.step(msg),
+            1 | 3 => delayed_votes.push(msg),
             _ => unreachable!(),
         }
     }
@@ -138,7 +266,7 @@ fn split_vote_eventually_resolves() {
     assert_ne!(n1.role(), &Role::Leader);
     assert_ne!(n2.role(), &Role::Leader);
 
-    for msg in delayed {
+    for msg in delayed_votes {
         match msg.to {
             1 => n1.step(msg),
             2 => n2.step(msg),
@@ -148,13 +276,13 @@ fn split_vote_eventually_resolves() {
         }
     }
 
-    let mut cleanup = Vec::new();
-    cleanup.extend(take_messages(&mut n1));
-    cleanup.extend(take_messages(&mut n2));
-    cleanup.extend(take_messages(&mut n3));
-    cleanup.extend(take_messages(&mut n4));
+    let mut vote_cleanup = Vec::new();
+    vote_cleanup.extend(take_messages(&mut n1));
+    vote_cleanup.extend(take_messages(&mut n2));
+    vote_cleanup.extend(take_messages(&mut n3));
+    vote_cleanup.extend(take_messages(&mut n4));
 
-    for msg in cleanup {
+    for msg in vote_cleanup {
         match msg.to {
             1 => n1.step(msg),
             2 => n2.step(msg),
@@ -169,7 +297,10 @@ fn split_vote_eventually_resolves() {
 
     tick_to_timeout(&mut n1);
 
-    for msg in take_messages(&mut n1) {
+    let prevote_retry = take_messages(&mut n1);
+    assert_all_prevote(&prevote_retry, 1, 2);
+
+    for msg in prevote_retry {
         match msg.to {
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -178,12 +309,33 @@ fn split_vote_eventually_resolves() {
         }
     }
 
-    let mut responses = Vec::new();
-    responses.extend(take_messages(&mut n2));
-    responses.extend(take_messages(&mut n3));
-    responses.extend(take_messages(&mut n4));
+    let mut prevote_retry_responses = Vec::new();
+    prevote_retry_responses.extend(take_messages(&mut n2));
+    prevote_retry_responses.extend(take_messages(&mut n3));
+    prevote_retry_responses.extend(take_messages(&mut n4));
 
-    for msg in responses {
+    for msg in prevote_retry_responses {
+        n1.step(msg);
+    }
+
+    let vote_retry = take_messages(&mut n1);
+    assert_all_request_vote(&vote_retry, 1, 2);
+
+    for msg in vote_retry {
+        match msg.to {
+            2 => n2.step(msg),
+            3 => n3.step(msg),
+            4 => n4.step(msg),
+            _ => unreachable!(),
+        }
+    }
+
+    let mut vote_retry_responses = Vec::new();
+    vote_retry_responses.extend(take_messages(&mut n2));
+    vote_retry_responses.extend(take_messages(&mut n3));
+    vote_retry_responses.extend(take_messages(&mut n4));
+
+    for msg in vote_retry_responses {
         n1.step(msg);
     }
 
@@ -192,14 +344,20 @@ fn split_vote_eventually_resolves() {
 }
 
 #[test]
-fn election_timeout_is_rearmed_within_randomized_window() {
+fn timeout_starts_prevote_and_rearms_within_randomized_window() {
     let mut node = new_node(1, vec![2, 3], 5);
 
     assert_eq!(node.current_election_timeout(), 5);
 
     tick_to_timeout(&mut node);
+    let prevotes = take_messages(&mut node);
 
     assert_eq!(node.role(), &Role::Candidate);
+    assert_eq!(node.current_term(), 0);
+    assert_eq!(node.voted_for(), None);
+    assert_eq!(prevotes.len(), 2);
+    assert_all_prevote(&prevotes, 1, 1);
+
     assert!(node.current_election_timeout() >= 5);
     assert!(node.current_election_timeout() < 10);
 }

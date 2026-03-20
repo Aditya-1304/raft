@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    message::{Envelope, Message, RequestVoteRequest, RequestVoteResponse},
+    message::{
+        Envelope, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse,
+    },
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{LeaderState, NodeId, Progress, Role},
 };
@@ -25,7 +27,7 @@ where
                 self.election_elapsed = self.election_elapsed.saturating_add(ticks);
 
                 if self.election_elapsed >= self.randomized_election_timeout {
-                    self.start_election();
+                    self.start_prevote();
                 }
             }
         }
@@ -39,17 +41,29 @@ where
         let from = envelope.from;
 
         match envelope.msg {
+            Message::PreVote(request) => {
+                self.handle_prevote_request(from, request);
+            }
+            Message::PreVoteResponse(response) => {
+                self.handle_prevote_response(from, response);
+            }
             Message::RequestVote(request) => self.handle_request_vote_request(from, request),
             Message::RequestVoteResponse(response) => {
                 self.handle_request_vote_response(from, response)
             }
             Message::AppendEntries(request) => {
+                if request.term >= self.current_term() {
+                    self.prevote_phase = false;
+                }
                 self.handle_append_entries_request(from, request);
             }
             Message::AppendEntriesResponse(response) => {
                 self.handle_append_entries_response_from(from, response);
             }
             Message::InstallSnapshot(request) => {
+                if request.term >= self.current_term() {
+                    self.prevote_phase = false;
+                }
                 self.handle_install_snapshot_request(from, request);
             }
             Message::InstallSnapshotResponse(response) => {
@@ -58,9 +72,39 @@ where
         }
     }
 
+    fn start_prevote(&mut self) {
+        self.set_role(Role::Candidate);
+        self.set_leader_id(None);
+        self.rearm_election_timer();
+        self.prevote_phase = true;
+        self.votes_received.clear();
+        self.votes_received.insert(self.id);
+
+        if self.votes_received.len() >= self.quorum_size() {
+            self.start_election();
+            return;
+        }
+
+        let request = PreVoteRequest {
+            term: self.current_term() + 1,
+            candidate_id: self.id,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
+        };
+
+        for peer in self.peers.iter().copied().filter(|peer| *peer != self.id) {
+            self.outbox.push(Envelope {
+                from: self.id,
+                to: peer,
+                msg: Message::PreVote(request.clone()),
+            });
+        }
+    }
+
     fn start_election(&mut self) {
         let next_term = self.current_term() + 1;
 
+        self.prevote_phase = false;
         self.set_current_term(next_term);
         self.set_role(Role::Candidate);
         self.set_leader_id(None);
@@ -91,6 +135,42 @@ where
         }
     }
 
+    fn handle_prevote_request(&mut self, from: NodeId, request: PreVoteRequest) {
+        let vote_granted = request.term >= self.current_term()
+            && self.is_log_up_to_date(request.last_log_index, request.last_log_term);
+
+        self.outbox.push(Envelope {
+            from: self.id,
+            to: from,
+            msg: Message::PreVoteResponse(PreVoteResponse {
+                term: self.current_term(),
+                vote_granted,
+            }),
+        });
+    }
+
+    fn handle_prevote_response(&mut self, from: NodeId, response: PreVoteResponse) {
+        if response.term > self.current_term() {
+            self.prevote_phase = false;
+            self.become_follower(response.term, None);
+            return;
+        }
+
+        if !self.prevote_phase {
+            return;
+        }
+
+        if !response.vote_granted {
+            return;
+        }
+
+        self.votes_received.insert(from);
+
+        if self.votes_received.len() >= self.quorum_size() {
+            self.start_election();
+        }
+    }
+
     fn handle_request_vote_request(&mut self, from: NodeId, request: RequestVoteRequest) {
         if request.term < self.current_term() {
             self.outbox.push(Envelope {
@@ -105,6 +185,7 @@ where
         }
 
         if request.term > self.current_term() {
+            self.prevote_phase = false;
             self.become_follower(request.term, None);
         }
 
@@ -129,11 +210,12 @@ where
 
     fn handle_request_vote_response(&mut self, from: NodeId, response: RequestVoteResponse) {
         if response.term > self.current_term() {
+            self.prevote_phase = false;
             self.become_follower(response.term, None);
             return;
         }
 
-        if self.soft_state.role != Role::Candidate {
+        if self.prevote_phase || self.soft_state.role != Role::Candidate {
             return;
         }
 
@@ -162,6 +244,7 @@ where
             );
         }
 
+        self.prevote_phase = false;
         self.set_role(Role::Leader);
         self.set_leader_id(Some(self.id));
         self.leader_state = Some(LeaderState { progress });

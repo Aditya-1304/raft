@@ -41,6 +41,7 @@ where
     pub(crate) heartbeat_interval: u64,
 
     pub(crate) votes_received: HashSet<NodeId>,
+    pub(crate) prevote_phase: bool,
 
     pub(crate) outbox: Vec<Envelope<C, S>>,
     pub(crate) committed: Vec<LogEntry<C>>,
@@ -88,6 +89,7 @@ where
             heartbeat_elapsed: 0,
             heartbeat_interval,
             votes_received: HashSet::new(),
+            prevote_phase: false,
             outbox: Vec::new(),
             committed: Vec::new(),
             pending_hard_state: None,

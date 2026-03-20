@@ -8,9 +8,10 @@ use crate::{
 
 use super::node::RaftNode;
 
-impl<C, LS, SS> RaftNode<C, LS, SS>
+impl<C, S, LS, SS> RaftNode<C, S, LS, SS>
 where
     C: Clone,
+    S: Clone,
     LS: LogStore<C>,
     SS: StableStore,
 {
@@ -30,7 +31,7 @@ where
         }
     }
 
-    pub fn step(&mut self, envelope: Envelope<C>) {
+    pub fn step(&mut self, envelope: Envelope<C, S>) {
         if envelope.to != self.id {
             return;
         }
@@ -47,6 +48,12 @@ where
             }
             Message::AppendEntriesResponse(response) => {
                 self.handle_append_entries_response_from(from, response);
+            }
+            Message::InstallSnapshot(request) => {
+                self.handle_install_snapshot_request(from, request);
+            }
+            Message::InstallSnapshotResponse(response) => {
+                self.handle_install_snapshot_response_from(from, response);
             }
         }
     }

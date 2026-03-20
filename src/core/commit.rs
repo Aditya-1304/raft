@@ -6,9 +6,10 @@ use crate::{
 
 use super::node::RaftNode;
 
-impl<C, LS, SS> RaftNode<C, LS, SS>
+impl<C, S, LS, SS> RaftNode<C, S, LS, SS>
 where
     C: Clone,
+    S: Clone,
     LS: LogStore<C>,
     SS: StableStore,
 {

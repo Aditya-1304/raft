@@ -236,6 +236,11 @@ where
         Ok(())
     }
 
+    fn set_snapshot_boundary(&mut self, index: LogIndex, term: Term) {
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+    }
+
     fn first_log_index(&self) -> LogIndex {
         self.entries
             .first()
@@ -369,11 +374,36 @@ where
 
         let remaining = self.entries(through + 1, usize::MAX);
         self.entries = remaining;
-        self.snapshot_index = through;
-        self.snapshot_term = term;
+        self.set_snapshot_boundary(through, term);
 
         self.persist_log_state()
             .expect("failed to persist log state during compact");
+    }
+
+    fn install_snapshot(&mut self, last_included_index: LogIndex, last_included_term: Term) {
+        if last_included_index < self.snapshot_index {
+            return;
+        }
+
+        if last_included_index == self.snapshot_index && last_included_term == self.snapshot_term {
+            return;
+        }
+
+        let keep_suffix = matches!(
+            self.term(last_included_index),
+            Some(term) if term == last_included_term
+        );
+
+        self.entries = if keep_suffix {
+            self.entries(last_included_index + 1, usize::MAX)
+        } else {
+            Vec::new()
+        };
+
+        self.set_snapshot_boundary(last_included_index, last_included_term);
+
+        self.persist_log_state()
+            .expect("failed to persist log state during install_snapshot");
     }
 }
 

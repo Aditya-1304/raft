@@ -1,6 +1,6 @@
 use crate::{
     entry::LogEntry,
-    types::{LogIndex, NodeId, Term},
+    types::{LogIndex, NodeId, Snapshot, Term},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,16 +37,32 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message<C> {
+pub struct InstallSnapshotRequest<S> {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub snapshot: Snapshot<S>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshotResponse {
+    pub term: Term,
+    pub success: bool,
+    pub last_included_index: LogIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message<C, S> {
     RequestVote(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntriesRequest<C>),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshotRequest<S>),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Envelope<C> {
+pub struct Envelope<C, S> {
     pub from: NodeId,
     pub to: NodeId,
-    pub msg: Message<C>,
+    pub msg: Message<C, S>,
 }

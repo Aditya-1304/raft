@@ -16,4 +16,6 @@ pub trait LogStore<C: Clone> {
     fn append(&mut self, entries: &[LogEntry<C>]);
     fn truncate_suffix(&mut self, from: LogIndex);
     fn compact(&mut self, through: LogIndex);
+
+    fn install_snapshot(&mut self, last_included_index: LogIndex, last_included_term: Term);
 }

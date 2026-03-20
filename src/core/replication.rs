@@ -1,15 +1,19 @@
 use crate::{
     entry::LogEntry,
-    message::{AppendEntriesRequest, AppendEntriesResponse, Envelope, Message},
+    message::{
+        AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
+        InstallSnapshotResponse, Message,
+    },
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{LogIndex, NodeId, Role, Term},
 };
 
 use super::node::RaftNode;
 
-impl<C, LS, SS> RaftNode<C, LS, SS>
+impl<C, S, LS, SS> RaftNode<C, S, LS, SS>
 where
     C: Clone,
+    S: Clone,
     LS: LogStore<C>,
     SS: StableStore,
 {
@@ -71,6 +75,10 @@ where
         else {
             return;
         };
+
+        if self.maybe_send_snapshot_to(to, next_index) {
+            return;
+        }
 
         let prev_log_index = next_index.saturating_sub(1);
         let prev_log_term = if prev_log_index == 0 {
@@ -174,6 +182,89 @@ where
         }
     }
 
+    pub(crate) fn handle_install_snapshot_request(
+        &mut self,
+        from: NodeId,
+        request: InstallSnapshotRequest<S>,
+    ) {
+        if request.term < self.current_term() {
+            self.reject_install_snapshot(from);
+            return;
+        }
+
+        self.become_follower(request.term, Some(request.leader_id));
+        self.reset_election_timer();
+
+        let snapshot_index = request.snapshot.last_included_index;
+        self.stage_snapshot(request.snapshot);
+        self.accept_install_snapshot(from, snapshot_index);
+    }
+
+    pub(crate) fn handle_install_snapshot_response_from(
+        &mut self,
+        from: NodeId,
+        response: InstallSnapshotResponse,
+    ) {
+        if response.term > self.current_term() {
+            self.become_follower(response.term, None);
+            return;
+        }
+
+        if response.term < self.current_term() {
+            return;
+        }
+
+        if self.soft_state.role != Role::Leader {
+            return;
+        }
+
+        let should_send_more = {
+            let Some(leader_state) = self.leader_state.as_mut() else {
+                return;
+            };
+
+            let Some(progress) = leader_state.progress.get_mut(&from) else {
+                return;
+            };
+
+            if !response.success {
+                return;
+            }
+
+            progress.match_index = progress.match_index.max(response.last_included_index);
+            progress.next_index = progress.next_index.max(response.last_included_index + 1);
+            progress.next_index <= self.last_log_index()
+        };
+
+        self.maybe_advance_commit();
+
+        if should_send_more {
+            self.send_append_entries_to(from);
+        }
+    }
+
+    fn maybe_send_snapshot_to(&mut self, to: NodeId, next_index: LogIndex) -> bool {
+        let Some(snapshot) = self.latest_snapshot().cloned() else {
+            return false;
+        };
+
+        if next_index > snapshot.last_included_index {
+            return false;
+        }
+
+        self.outbox.push(Envelope {
+            from: self.id,
+            to,
+            msg: Message::InstallSnapshot(InstallSnapshotRequest {
+                term: self.current_term(),
+                leader_id: self.id,
+                snapshot,
+            }),
+        });
+
+        true
+    }
+
     fn accept_append_entries(&mut self, to: NodeId, match_index: LogIndex) {
         self.outbox.push(Envelope {
             from: self.id,
@@ -203,6 +294,30 @@ where
                 match_index: None,
                 conflict_term,
                 conflict_index: Some(conflict_index),
+            }),
+        });
+    }
+
+    fn accept_install_snapshot(&mut self, to: NodeId, last_included_index: LogIndex) {
+        self.outbox.push(Envelope {
+            from: self.id,
+            to,
+            msg: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: self.current_term(),
+                success: true,
+                last_included_index,
+            }),
+        });
+    }
+
+    fn reject_install_snapshot(&mut self, to: NodeId) {
+        self.outbox.push(Envelope {
+            from: self.id,
+            to,
+            msg: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: self.current_term(),
+                success: false,
+                last_included_index: self.first_log_index().saturating_sub(1),
             }),
         });
     }

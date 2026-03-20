@@ -1,7 +1,7 @@
 use raft::{core::node::RaftNode, message::Envelope, storage::mem::MemStorage, types::Role};
 
 type TestStorage = MemStorage<(), ()>;
-type TestNode = RaftNode<(), TestStorage, TestStorage>;
+type TestNode = RaftNode<(), (), TestStorage, TestStorage>;
 
 fn new_node(id: u64, peers: Vec<u64>, election_timeout: u64, heartbeat_interval: u64) -> TestNode {
     RaftNode::new(
@@ -14,7 +14,7 @@ fn new_node(id: u64, peers: Vec<u64>, election_timeout: u64, heartbeat_interval:
     )
 }
 
-fn take_messages(node: &mut TestNode) -> Vec<Envelope<()>> {
+fn take_messages(node: &mut TestNode) -> Vec<Envelope<(), ()>> {
     node.ready().messages
 }
 

@@ -19,7 +19,7 @@ use raft::{
 type TestCmd = u64;
 type TestLogStore = FileLogStore<TestCmd, U64Codec>;
 type TestStableStore = FileStableStore;
-type TestNode = RaftNode<TestCmd, TestLogStore, TestStableStore>;
+type TestNode = RaftNode<TestCmd, (), TestLogStore, TestStableStore>;
 
 const ELECTION_TIMEOUT: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 2;
@@ -88,18 +88,18 @@ fn reopen_log(files: &NodeFiles) -> TestLogStore {
     FileLogStore::open(files.log.clone(), U64Codec).unwrap()
 }
 
-fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd>>) {
+fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
     for msg in messages {
         let idx = (msg.to - 1) as usize;
         nodes[idx].step(msg);
     }
 }
 
-fn take_ready(node: &mut TestNode) -> Ready<TestCmd> {
+fn take_ready(node: &mut TestNode) -> Ready<TestCmd, ()> {
     node.ready()
 }
 
-fn drain_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd>> {
+fn drain_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
     node.ready().messages
 }
 

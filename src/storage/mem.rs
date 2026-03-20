@@ -1,14 +1,14 @@
 use crate::{
     entry::LogEntry,
     traits::{log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore},
-    types::{HardState, LogIndex, Term},
+    types::{HardState, LogIndex, Snapshot, Term},
 };
 
 #[derive(Debug, Clone)]
 pub struct MemStorage<C, S> {
     hard_state: HardState,
     entries: Vec<LogEntry<C>>,
-    snapshot: Option<S>,
+    snapshot: Option<Snapshot<S>>,
     snapshot_index: LogIndex,
     snapshot_term: Term,
 }
@@ -29,37 +29,22 @@ impl<C, S> MemStorage<C, S> {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl<C, S> StableStore for MemStorage<C, S> {
-    fn hard_state(&self) -> HardState {
-        self.hard_state.clone()
+    fn set_snapshot_boundary(&mut self, index: LogIndex, term: Term) {
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+
+        let keep_snapshot = matches!(
+            self.snapshot.as_ref(),
+            Some(snapshot)
+                if snapshot.last_included_index == index && snapshot.last_included_term == term
+        );
+
+        if !keep_snapshot {
+            self.snapshot = None;
+        }
     }
 
-    fn set_hard_state(&mut self, hs: HardState) {
-        self.hard_state = hs;
-    }
-}
-
-impl<C, S> SnapshotStore<S> for MemStorage<C, S> {
-    fn latest(&self) -> Option<&S> {
-        self.snapshot.as_ref()
-    }
-
-    fn save(&mut self, snapshot: S) {
-        self.snapshot = Some(snapshot);
-    }
-
-    fn last_included_index(&self) -> LogIndex {
-        self.snapshot_index
-    }
-
-    fn last_included_term(&self) -> Term {
-        self.snapshot_term
-    }
-}
-
-impl<C, S> MemStorage<C, S> {
     fn first_log_index(&self) -> LogIndex {
         self.entries
             .first()
@@ -83,6 +68,38 @@ impl<C, S> MemStorage<C, S> {
         } else {
             Some((index - first) as usize)
         }
+    }
+}
+
+impl<C, S> StableStore for MemStorage<C, S> {
+    fn hard_state(&self) -> HardState {
+        self.hard_state.clone()
+    }
+
+    fn set_hard_state(&mut self, hs: HardState) {
+        self.hard_state = hs;
+    }
+}
+
+impl<C, S> SnapshotStore<S> for MemStorage<C, S> {
+    fn latest(&self) -> Option<&Snapshot<S>> {
+        self.snapshot.as_ref()
+    }
+
+    fn save(&mut self, snapshot: Snapshot<S>) {
+        let index = snapshot.last_included_index;
+        let term = snapshot.last_included_term;
+
+        self.set_snapshot_boundary(index, term);
+        self.snapshot = Some(snapshot);
+    }
+
+    fn last_included_index(&self) -> LogIndex {
+        self.snapshot_index
+    }
+
+    fn last_included_term(&self) -> Term {
+        self.snapshot_term
     }
 }
 
@@ -141,7 +158,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
             panic!(
                 "attempted to append non-contiguous entries: first_new_index={}, expected_next={}",
                 first_new_index, expected_next
-            )
+            );
         }
 
         self.truncate_suffix(first_new_index);
@@ -152,11 +169,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
         let first = self.first_log_index();
         let last = self.last_log_index();
 
-        if from > last {
-            return;
-        }
-
-        if from < first {
+        if from > last || from < first {
             return;
         }
 
@@ -181,7 +194,29 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
 
         let remaining = self.entries(through + 1, usize::MAX);
         self.entries = remaining;
-        self.snapshot_index = through;
-        self.snapshot_term = term;
+        self.set_snapshot_boundary(through, term);
+    }
+
+    fn install_snapshot(&mut self, last_included_index: LogIndex, last_included_term: Term) {
+        if last_included_index < self.snapshot_index {
+            return;
+        }
+
+        if last_included_index == self.snapshot_index && last_included_term == self.snapshot_term {
+            return;
+        }
+
+        let keep_suffix = matches!(
+            self.term(last_included_index),
+            Some(term) if term == last_included_term
+        );
+
+        self.entries = if keep_suffix {
+            self.entries(last_included_index + 1, usize::MAX)
+        } else {
+            Vec::new()
+        };
+
+        self.set_snapshot_boundary(last_included_index, last_included_term);
     }
 }

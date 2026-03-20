@@ -9,7 +9,7 @@ use raft::{
 
 type TestCmd = u64;
 type TestStorage = MemStorage<TestCmd, ()>;
-type TestNode = RaftNode<TestCmd, TestStorage, TestStorage>;
+type TestNode = RaftNode<TestCmd, (), TestStorage, TestStorage>;
 
 const ELECTION_TIMEOUT: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 2;
@@ -50,14 +50,14 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
     RaftNode::new(id, peers, log, stable, ELECTION_TIMEOUT, HEARTBEAT_INTERVAL)
 }
 
-fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd>>) {
+fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
     for msg in messages {
         let idx = (msg.to - 1) as usize;
         nodes[idx].step(msg);
     }
 }
 
-fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd>> {
+fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
     node.ready().messages
 }
 

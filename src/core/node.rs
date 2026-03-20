@@ -5,7 +5,7 @@ use crate::{
     entry::LogEntry,
     message::Envelope,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{HardState, LeaderState, LogIndex, NodeId, Role, SoftState, Term},
+    types::{HardState, LeaderState, LogIndex, NodeId, Role, Snapshot, SoftState, Term},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -14,9 +14,10 @@ pub enum ProposeError {
 }
 
 #[derive(Debug)]
-pub struct RaftNode<C, LS, SS>
+pub struct RaftNode<C, S, LS, SS>
 where
     C: Clone,
+    S: Clone,
     LS: LogStore<C>,
     SS: StableStore,
 {
@@ -39,17 +40,20 @@ where
 
     pub(crate) votes_received: HashSet<NodeId>,
 
-    pub(crate) outbox: Vec<Envelope<C>>,
+    pub(crate) outbox: Vec<Envelope<C, S>>,
     pub(crate) committed: Vec<LogEntry<C>>,
 
     pub(crate) pending_hard_state: Option<HardState>,
     pub(crate) pending_entries: Vec<LogEntry<C>>,
+    pub(crate) pending_snapshot: Option<Snapshot<S>>,
+    pub(crate) latest_snapshot: Option<Snapshot<S>>,
     pub(crate) soft_state_changed: bool,
 }
 
-impl<C, LS, SS> RaftNode<C, LS, SS>
+impl<C, S, LS, SS> RaftNode<C, S, LS, SS>
 where
     C: Clone,
+    S: Clone,
     LS: LogStore<C>,
     SS: StableStore,
 {
@@ -81,6 +85,8 @@ where
             committed: Vec::new(),
             pending_hard_state: None,
             pending_entries: Vec::new(),
+            pending_snapshot: None,
+            latest_snapshot: None,
             soft_state_changed: false,
         }
     }
@@ -104,10 +110,11 @@ where
         Ok(entry.index)
     }
 
-    pub fn ready(&mut self) -> Ready<C> {
+    pub fn ready(&mut self) -> Ready<C, S> {
         let ready = Ready {
             hard_state: self.pending_hard_state.take(),
             entries_to_persist: std::mem::take(&mut self.pending_entries),
+            snapshot: self.pending_snapshot.take(),
             messages: std::mem::take(&mut self.outbox),
             committed_entries: std::mem::take(&mut self.committed),
             soft_state_changed: self.soft_state_changed,
@@ -121,6 +128,21 @@ where
         if applied_through > self.last_applied {
             self.last_applied = applied_through;
         }
+    }
+
+    pub fn restore_snapshot(&mut self, snapshot: Snapshot<S>) {
+        let snapshot_index = snapshot.last_included_index;
+        let snapshot_term = snapshot.last_included_term;
+
+        if self.should_ignore_snapshot(snapshot_index, snapshot_term) {
+            return;
+        }
+
+        self.log.install_snapshot(snapshot_index, snapshot_term);
+        self.commit_to_snapshot(snapshot_index);
+        self.committed.retain(|entry| entry.index > snapshot_index);
+        self.pending_snapshot = None;
+        self.latest_snapshot = Some(snapshot);
     }
 
     pub fn id(&self) -> NodeId {
@@ -147,11 +169,74 @@ where
         self.commit_index
     }
 
+    pub fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+
+    pub fn first_log_index(&self) -> LogIndex {
+        self.log.first_index()
+    }
+
     pub fn last_log_index(&self) -> LogIndex {
         self.log.last_index()
     }
 
     pub fn last_log_term(&self) -> Term {
         self.log.term(self.last_log_index()).unwrap_or(0)
+    }
+
+    pub fn latest_snapshot(&self) -> Option<&Snapshot<S>> {
+        self.latest_snapshot.as_ref()
+    }
+
+    pub(crate) fn stage_snapshot(&mut self, snapshot: Snapshot<S>) {
+        let snapshot_index = snapshot.last_included_index;
+        let snapshot_term = snapshot.last_included_term;
+
+        if self.should_ignore_snapshot(snapshot_index, snapshot_term) {
+            return;
+        }
+
+        self.log.install_snapshot(snapshot_index, snapshot_term);
+        self.commit_to_snapshot(snapshot_index);
+        self.pending_entries.clear();
+        self.committed.retain(|entry| entry.index > snapshot_index);
+        self.pending_snapshot = Some(snapshot);
+    }
+
+    fn commit_to_snapshot(&mut self, snapshot_index: LogIndex) {
+        if snapshot_index <= self.commit_index {
+            return;
+        }
+
+        self.commit_index = snapshot_index;
+
+        let mut hs = self.stable.hard_state();
+        if hs.commit < snapshot_index {
+            hs.commit = snapshot_index;
+            self.set_hard_state(hs);
+        }
+    }
+
+    fn current_snapshot_index(&self) -> LogIndex {
+        self.log.first_index().saturating_sub(1)
+    }
+
+    fn current_snapshot_term(&self) -> Term {
+        let index = self.current_snapshot_index();
+
+        if index == 0 {
+            0
+        } else {
+            self.log.term(index).unwrap_or(0)
+        }
+    }
+
+    fn should_ignore_snapshot(&self, snapshot_index: LogIndex, snapshot_term: Term) -> bool {
+        let current_index = self.current_snapshot_index();
+        let current_term = self.current_snapshot_term();
+
+        snapshot_index < current_index
+            || (snapshot_index == current_index && snapshot_term == current_term)
     }
 }

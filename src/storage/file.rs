@@ -6,16 +6,22 @@ use std::{
 
 use crate::{
     entry::LogEntry,
-    traits::{log_store::LogStore, stable_store::StableStore},
-    types::{HardState, LogIndex, NodeId, Term},
+    traits::{log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore},
+    types::{HardState, LogIndex, NodeId, Snapshot, Term},
 };
 
-use super::codec::CommandCodec;
+use super::codec::{CommandCodec, SnapshotCodec};
 
 #[derive(Debug, Clone)]
 pub struct FileStableStore {
     path: PathBuf,
     hard_state: HardState,
+}
+
+pub struct FileSnapshotStore<S, Codec> {
+    path: PathBuf,
+    codec: Codec,
+    snapshot: Option<Snapshot<S>>,
 }
 
 pub struct FileLogStore<C, Codec> {
@@ -117,6 +123,130 @@ impl StableStore for FileStableStore {
         self.persist_hard_state(&hs)
             .expect("failed to persist HardState to FileStableStore");
         self.hard_state = hs;
+    }
+}
+
+impl<S, Codec> FileSnapshotStore<S, Codec>
+where
+    Codec: SnapshotCodec<S>,
+{
+    pub fn open(path: impl Into<PathBuf>, codec: Codec) -> io::Result<Self> {
+        let path = path.into();
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let snapshot = if path.exists() {
+            Self::read_snapshot(&path, &codec)?
+        } else {
+            None
+        };
+
+        Ok(Self {
+            path,
+            codec,
+            snapshot,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_snapshot(path: &Path, codec: &Codec) -> io::Result<Option<Snapshot<S>>> {
+        let contents = fs::read_to_string(path)?;
+
+        if contents.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let mut last_included_index = None;
+        let mut last_included_term = None;
+        let mut data_hex = None;
+
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let (key, value) = line.split_once('=').ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid snapshot line: {line}"),
+                )
+            })?;
+
+            match key.trim() {
+                "last_included_index" => {
+                    last_included_index = Some(parse_u64("last_included_index", value.trim())?)
+                }
+                "last_included_term" => {
+                    last_included_term = Some(parse_u64("last_included_term", value.trim())?)
+                }
+                "data" => data_hex = Some(value.trim().to_string()),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown snapshot field: {other}"),
+                    ));
+                }
+            }
+        }
+
+        let last_included_index = last_included_index.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot file missing last_included_index",
+            )
+        })?;
+        let last_included_term = last_included_term.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot file missing last_included_term",
+            )
+        })?;
+        let data_hex = data_hex.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot file missing data")
+        })?;
+
+        let data_bytes = decode_hex(&data_hex)?;
+        let data = codec.decode(&data_bytes)?;
+
+        Ok(Some(Snapshot {
+            last_included_index,
+            last_included_term,
+            data,
+        }))
+    }
+
+    fn persist_snapshot(&self, snapshot: &Snapshot<S>) -> io::Result<()> {
+        let tmp_path = self.path.with_extension("tmp");
+        let data_bytes = self.codec.encode(&snapshot.data)?;
+        let data_hex = encode_hex(&data_bytes);
+        let encoded = format!(
+            "last_included_index={}\nlast_included_term={}\ndata={}\n",
+            snapshot.last_included_index, snapshot.last_included_term, data_hex
+        );
+
+        let mut tmp = File::create(&tmp_path)?;
+        tmp.write_all(encoded.as_bytes())?;
+        tmp.sync_all()?;
+        drop(tmp);
+
+        fs::rename(&tmp_path, &self.path)?;
+        Ok(())
+    }
+}
+
+impl<S, Codec> SnapshotStore<S> for FileSnapshotStore<S, Codec>
+where
+    Codec: SnapshotCodec<S>,
+{
+    fn latest(&self) -> Option<&Snapshot<S>> {
+        self.snapshot.as_ref()
+    }
+
+    fn save(&mut self, snapshot: Snapshot<S>) {
+        self.persist_snapshot(&snapshot)
+            .expect("failed to persist snapshot to FileSnapshotStore");
+        self.snapshot = Some(snapshot);
     }
 }
 

@@ -134,7 +134,7 @@ where
         let snapshot_index = snapshot.last_included_index;
         let snapshot_term = snapshot.last_included_term;
 
-        if self.should_ignore_snapshot(snapshot_index, snapshot_term) {
+        if self.is_snapshot_stale(snapshot_index, snapshot_term) {
             return;
         }
 
@@ -193,7 +193,7 @@ where
         let snapshot_index = snapshot.last_included_index;
         let snapshot_term = snapshot.last_included_term;
 
-        if self.should_ignore_snapshot(snapshot_index, snapshot_term) {
+        if self.should_ignore_staged_snapshot(snapshot_index, snapshot_term) {
             return;
         }
 
@@ -232,11 +232,19 @@ where
         }
     }
 
-    fn should_ignore_snapshot(&self, snapshot_index: LogIndex, snapshot_term: Term) -> bool {
+    fn is_snapshot_stale(&self, snapshot_index: LogIndex, snapshot_term: Term) -> bool {
         let current_index = self.current_snapshot_index();
         let current_term = self.current_snapshot_term();
 
         snapshot_index < current_index
+            || (snapshot_index == current_index && snapshot_term < current_term)
+    }
+
+    fn should_ignore_staged_snapshot(&self, snapshot_index: LogIndex, snapshot_term: Term) -> bool {
+        let current_index = self.current_snapshot_index();
+        let current_term = self.current_snapshot_term();
+
+        self.is_snapshot_stale(snapshot_index, snapshot_term)
             || (snapshot_index == current_index && snapshot_term == current_term)
     }
 }

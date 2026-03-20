@@ -24,13 +24,18 @@ fn take_messages(node: &mut TestNode) -> Vec<Envelope<(), ()>> {
     node.ready().messages
 }
 
+fn tick_to_timeout(node: &mut TestNode) {
+    let timeout = node.current_election_timeout();
+    node.tick(timeout);
+}
+
 #[test]
 fn one_leader_is_elected() {
     let mut n1 = new_node(1, vec![2, 3], 5);
     let mut n2 = new_node(2, vec![1, 3], 5);
     let mut n3 = new_node(3, vec![1, 2], 5);
 
-    n1.tick(5);
+    tick_to_timeout(&mut n1);
     let requests = take_messages(&mut n1);
 
     assert_eq!(n1.role(), &Role::Candidate);
@@ -99,8 +104,8 @@ fn split_vote_eventually_resolves() {
     let mut n3 = new_node(3, vec![1, 2, 4], 5);
     let mut n4 = new_node(4, vec![1, 2, 3], 5);
 
-    n1.tick(5);
-    n2.tick(5);
+    tick_to_timeout(&mut n1);
+    tick_to_timeout(&mut n2);
 
     let requests_1 = take_messages(&mut n1);
     let requests_2 = take_messages(&mut n2);
@@ -162,7 +167,7 @@ fn split_vote_eventually_resolves() {
     assert_ne!(n1.role(), &Role::Leader);
     assert_ne!(n2.role(), &Role::Leader);
 
-    n1.tick(5);
+    tick_to_timeout(&mut n1);
 
     for msg in take_messages(&mut n1) {
         match msg.to {
@@ -184,4 +189,17 @@ fn split_vote_eventually_resolves() {
 
     assert_eq!(n1.role(), &Role::Leader);
     assert_eq!(n1.leader_id(), Some(1));
+}
+
+#[test]
+fn election_timeout_is_rearmed_within_randomized_window() {
+    let mut node = new_node(1, vec![2, 3], 5);
+
+    assert_eq!(node.current_election_timeout(), 5);
+
+    tick_to_timeout(&mut node);
+
+    assert_eq!(node.role(), &Role::Candidate);
+    assert!(node.current_election_timeout() >= 5);
+    assert!(node.current_election_timeout() < 10);
 }

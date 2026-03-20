@@ -61,6 +61,11 @@ where
         self.election_elapsed = 0;
     }
 
+    pub(crate) fn rearm_election_timer(&mut self) {
+        self.election_elapsed = 0;
+        self.randomize_next_election_timeout();
+    }
+
     pub(crate) fn reset_heartbeat_timer(&mut self) {
         self.heartbeat_elapsed = 0;
     }
@@ -74,7 +79,7 @@ where
         self.set_leader_id(leader_id);
         self.leader_state = None;
         self.votes_received.clear();
-        self.reset_election_timer();
+        self.rearm_election_timer();
         self.reset_heartbeat_timer();
     }
 }

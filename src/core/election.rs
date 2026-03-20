@@ -24,7 +24,7 @@ where
             Role::Follower | Role::Candidate => {
                 self.election_elapsed = self.election_elapsed.saturating_add(ticks);
 
-                if self.election_elapsed >= self.election_timeout {
+                if self.election_elapsed >= self.randomized_election_timeout {
                     self.start_election();
                 }
             }
@@ -64,7 +64,7 @@ where
         self.set_current_term(next_term);
         self.set_role(Role::Candidate);
         self.set_leader_id(None);
-        self.reset_election_timer();
+        self.rearm_election_timer();
         self.votes_received.clear();
 
         self.set_voted_for(Some(self.id));
@@ -114,7 +114,7 @@ where
 
         if vote_granted {
             self.set_voted_for(Some(request.candidate_id));
-            self.reset_election_timer();
+            self.rearm_election_timer();
         }
 
         self.outbox.push(Envelope {

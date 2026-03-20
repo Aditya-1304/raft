@@ -35,6 +35,8 @@ where
 
     pub(crate) election_elapsed: u64,
     pub(crate) election_timeout: u64,
+    pub(crate) randomized_election_timeout: u64,
+    pub(crate) election_rng_state: u64,
     pub(crate) heartbeat_elapsed: u64,
     pub(crate) heartbeat_interval: u64,
 
@@ -66,6 +68,9 @@ where
         heartbeat_interval: u64,
     ) -> Self {
         let hard_state = stable.hard_state();
+        let election_timeout = election_timeout.max(1);
+        let election_rng_state =
+            Self::initial_election_rng_seed(id, &peers, election_timeout, heartbeat_interval);
 
         Self {
             id,
@@ -78,6 +83,8 @@ where
             leader_state: None,
             election_elapsed: 0,
             election_timeout,
+            randomized_election_timeout: election_timeout,
+            election_rng_state,
             heartbeat_elapsed: 0,
             heartbeat_interval,
             votes_received: HashSet::new(),
@@ -189,6 +196,10 @@ where
         self.latest_snapshot.as_ref()
     }
 
+    pub fn current_election_timeout(&self) -> u64 {
+        self.randomized_election_timeout
+    }
+
     pub(crate) fn stage_snapshot(&mut self, snapshot: Snapshot<S>) {
         let snapshot_index = snapshot.last_included_index;
         let snapshot_term = snapshot.last_included_term;
@@ -202,6 +213,12 @@ where
         self.pending_entries.clear();
         self.committed.retain(|entry| entry.index > snapshot_index);
         self.pending_snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn randomize_next_election_timeout(&mut self) {
+        let base = self.election_timeout.max(1);
+        let jitter = self.next_election_random_u64() % base;
+        self.randomized_election_timeout = base + jitter;
     }
 
     fn commit_to_snapshot(&mut self, snapshot_index: LogIndex) {
@@ -246,5 +263,35 @@ where
 
         self.is_snapshot_stale(snapshot_index, snapshot_term)
             || (snapshot_index == current_index && snapshot_term == current_term)
+    }
+
+    fn next_election_random_u64(&mut self) -> u64 {
+        let mut state = self.election_rng_state;
+
+        if state == 0 {
+            state = 1;
+        }
+
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+
+        self.election_rng_state = state;
+        state
+    }
+
+    fn initial_election_rng_seed(
+        id: NodeId,
+        peers: &[NodeId],
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> u64 {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        seed ^= id.rotate_left(7);
+        seed ^= (peers.len() as u64).rotate_left(17);
+        seed ^= election_timeout.rotate_left(31);
+        seed ^= heartbeat_interval.rotate_left(47);
+
+        if seed == 0 { 1 } else { seed }
     }
 }

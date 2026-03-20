@@ -148,6 +148,8 @@ where
             return;
         }
 
+        self.mark_leader_peer_active(from);
+
         let leader_last_index = self.last_log_index();
         let retry_next = self.backtrack_next_index(&response);
 
@@ -217,6 +219,8 @@ where
         if self.soft_state.role != Role::Leader {
             return;
         }
+
+        self.mark_leader_peer_active(from);
 
         let should_send_more = {
             let Some(leader_state) = self.leader_state.as_mut() else {

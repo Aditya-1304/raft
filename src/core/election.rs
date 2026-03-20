@@ -21,6 +21,12 @@ where
         match self.soft_state.role {
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(ticks);
+                self.election_elapsed = self.election_elapsed.saturating_add(ticks);
+
+                if self.maybe_step_down_on_quorum_loss() {
+                    return;
+                }
+
                 self.maybe_send_heartbeats();
             }
             Role::Follower | Role::Candidate => {
@@ -54,6 +60,7 @@ where
             Message::AppendEntries(request) => {
                 if request.term >= self.current_term() {
                     self.prevote_phase = false;
+                    self.leader_recent_active.clear();
                 }
                 self.handle_append_entries_request(from, request);
             }
@@ -63,6 +70,7 @@ where
             Message::InstallSnapshot(request) => {
                 if request.term >= self.current_term() {
                     self.prevote_phase = false;
+                    self.leader_recent_active.clear();
                 }
                 self.handle_install_snapshot_request(from, request);
             }
@@ -77,6 +85,7 @@ where
         self.set_leader_id(None);
         self.rearm_election_timer();
         self.prevote_phase = true;
+        self.leader_recent_active.clear();
         self.votes_received.clear();
         self.votes_received.insert(self.id);
 
@@ -105,6 +114,7 @@ where
         let next_term = self.current_term() + 1;
 
         self.prevote_phase = false;
+        self.leader_recent_active.clear();
         self.set_current_term(next_term);
         self.set_role(Role::Candidate);
         self.set_leader_id(None);
@@ -152,6 +162,7 @@ where
     fn handle_prevote_response(&mut self, from: NodeId, response: PreVoteResponse) {
         if response.term > self.current_term() {
             self.prevote_phase = false;
+            self.leader_recent_active.clear();
             self.become_follower(response.term, None);
             return;
         }
@@ -186,6 +197,7 @@ where
 
         if request.term > self.current_term() {
             self.prevote_phase = false;
+            self.leader_recent_active.clear();
             self.become_follower(request.term, None);
         }
 
@@ -211,6 +223,7 @@ where
     fn handle_request_vote_response(&mut self, from: NodeId, response: RequestVoteResponse) {
         if response.term > self.current_term() {
             self.prevote_phase = false;
+            self.leader_recent_active.clear();
             self.become_follower(response.term, None);
             return;
         }
@@ -245,6 +258,7 @@ where
         }
 
         self.prevote_phase = false;
+        self.leader_recent_active.clear();
         self.set_role(Role::Leader);
         self.set_leader_id(Some(self.id));
         self.leader_state = Some(LeaderState { progress });
@@ -252,6 +266,42 @@ where
         self.reset_election_timer();
         self.reset_heartbeat_timer();
         self.broadcast_heartbeats();
+    }
+
+    pub(crate) fn mark_leader_peer_active(&mut self, from: NodeId) {
+        if self.soft_state.role != Role::Leader {
+            return;
+        }
+
+        if from != self.id && self.peers.contains(&from) {
+            self.leader_recent_active.insert(from);
+        }
+    }
+
+    fn maybe_step_down_on_quorum_loss(&mut self) -> bool {
+        if self.soft_state.role != Role::Leader {
+            return false;
+        }
+
+        if self.election_elapsed < self.election_timeout {
+            return false;
+        }
+
+        let has_quorum = self.has_check_quorum();
+        self.leader_recent_active.clear();
+        self.reset_election_timer();
+
+        if has_quorum {
+            return false;
+        }
+
+        self.prevote_phase = false;
+        self.become_follower(self.current_term(), None);
+        true
+    }
+
+    fn has_check_quorum(&self) -> bool {
+        1 + self.leader_recent_active.len() >= self.quorum_size()
     }
 
     fn quorum_size(&self) -> usize {

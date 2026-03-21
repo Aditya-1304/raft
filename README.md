@@ -243,6 +243,8 @@ If you want the live cluster, read `src/runtime` and `src/main.rs`.
 
 Raft is mostly about a few pieces of state and how carefully they are updated.
 
+![alt text](images/image.png)
+
 The basic types live in [`src/types.rs`](src/types.rs):
 
 ```rust
@@ -315,6 +317,8 @@ The command is generic. The algorithm does not care whether the entry is:
 That separation is exactly right.
 
 ### Snapshots
+
+![alt text](images/image-1.png)
 
 Snapshots are represented as:
 
@@ -556,7 +560,6 @@ The leader immediately initializes follower progress and starts asserting author
 
 ### Election sequence
 
-<!-- Replace with docs/diagrams/election.svg if you want a polished exported figure -->
 
 ```mermaid
 sequenceDiagram

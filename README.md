@@ -48,20 +48,20 @@ That split is the difference between “a distributed system that happens to com
 
 ## What This Repository Implements
 
-| Area | Status | Notes |
-|---|---|---|
-| Leader election | Implemented | Randomized timeouts, PreVote, vote freshness checks |
-| Strong leader replication | Implemented | Entries only originate at the leader |
-| Heartbeats | Implemented | Empty `AppendEntries` maintain leadership |
-| Quorum-loss stepdown | Implemented | Leader steps down when it stops hearing from a majority |
-| Log repair | Implemented | Follower conflict reporting + leader fast backtracking |
-| Commit advancement | Implemented | Uses majority match index + current-term rule |
-| Snapshot install | Implemented | `InstallSnapshot` RPC and follower staging |
-| Local snapshot creation | Implemented | Runtime policy creates snapshots from applied state |
-| Log compaction | Implemented | Both memory and file-backed stores compact correctly |
-| Crash recovery | Implemented | Snapshot restore + replay of committed suffix |
-| Deterministic simulation | Implemented | Drops, delays, partitions, duplication, crash/restart |
-| Real TCP runtime | Implemented | Separate processes, file-backed state, admin plane |
+| Area | Notes |
+|---|---|
+| Leader election | Randomized timeouts, PreVote, vote freshness checks |
+| Strong leader replication | Entries only originate at the leader |
+| Heartbeats | Empty `AppendEntries` maintain leadership |
+| Quorum-loss stepdown | Leader steps down when it stops hearing from a majority |
+| Log repair |  Follower conflict reporting + leader fast backtracking |
+| Commit advancement | Uses majority match index + current-term rule |
+| Snapshot install | `InstallSnapshot` RPC and follower staging |
+| Local snapshot creation | Runtime policy creates snapshots from applied state |
+| Log compaction | Both memory and file-backed stores compact correctly |
+| Crash recovery | Snapshot restore + replay of committed suffix |
+| Deterministic simulation | Drops, delays, partitions, duplication, crash/restart |
+| Real TCP runtime | Separate processes, file-backed state, admin plane |
 
 
 The shipped runtime uses a replicated **counter** as the demo application in [`src/main.rs`](src/main.rs). The simulator tests use a replicated **in-memory key-value machine** in [`src/sm/mem_kv.rs`](src/sm/mem_kv.rs).
@@ -1687,7 +1687,6 @@ cargo test --test sim_smoke -- --nocapture
 ## References
 
 - [Raft paper: In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
-- [Architecture.md](Architecture.md)
 
 ### Code map
 
@@ -1702,21 +1701,3 @@ cargo test --test sim_smoke -- --nocapture
 - Tests: [`tests`](tests)
 
 ---
-
-## Closing
-
-Raft is only interesting if the implementation survives contact with failure.
-
-This repository does:
-
-- it elects a leader,
-- it replicates commands,
-- it repairs divergent logs,
-- it commits correctly,
-- it compacts state,
-- it restarts from disk,
-- it steps down when leadership is no longer justified,
-- it survives partitions and crash/restart scenarios in simulation,
-- and it can be run as real separate server processes over TCP.
-
-That is the difference between a Raft sketch and a Raft system.

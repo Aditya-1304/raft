@@ -21,8 +21,6 @@ The reference paper for the implementation is:
 
 - [In Search of an Understandable Consensus Algorithm (Extended Version)](https://raft.github.io/raft.pdf)
 
-If you want the design rationale specific to this repository, start with [Architecture.md](Architecture.md).
-
 ---
 
 ## Why Raft

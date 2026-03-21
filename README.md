@@ -64,10 +64,7 @@ That split is the difference between “a distributed system that happens to com
 | Crash recovery | Implemented | Snapshot restore + replay of committed suffix |
 | Deterministic simulation | Implemented | Drops, delays, partitions, duplication, crash/restart |
 | Real TCP runtime | Implemented | Separate processes, file-backed state, admin plane |
-| ReadIndex | Not implemented | Future work |
-| Leadership transfer | Not implemented | Future work |
-| Membership changes | Not implemented | Future work |
-| Full tracing / metrics export | Not implemented | Basic counters exist, full observability stack does not |
+
 
 The shipped runtime uses a replicated **counter** as the demo application in [`src/main.rs`](src/main.rs). The simulator tests use a replicated **in-memory key-value machine** in [`src/sm/mem_kv.rs`](src/sm/mem_kv.rs).
 

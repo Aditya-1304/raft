@@ -75,7 +75,6 @@ The shipped runtime uses a replicated **counter** as the demo application in [`s
 
 ## Architecture
 
-<!-- Replace with docs/diagrams/architecture.svg if you want a polished exported figure -->
 
 ```mermaid
 flowchart TD
@@ -430,7 +429,6 @@ That is where subtle bugs usually begin.
 
 ### Runtime flow
 
-<!-- Replace with docs/diagrams/ready-flow.svg if you want a polished version -->
 
 ```mermaid
 sequenceDiagram
@@ -760,7 +758,6 @@ This is Raft’s overwrite rule in concrete form:
 
 ### Replication flow
 
-<!-- Replace with docs/diagrams/replication.svg if you want a polished exported figure -->
 
 ```mermaid
 sequenceDiagram
@@ -1088,8 +1085,6 @@ This is what makes log compaction actually happen in the real runtime instead of
 
 ### Snapshot lifecycle
 
-<!-- Replace with docs/diagrams/snapshot.svg if you want a polished exported figure -->
-
 ```mermaid
 flowchart TD
     A[Committed entries applied] --> B{Snapshot threshold reached?}
@@ -1197,7 +1192,9 @@ It lives in [`src/sim`](src/sim) and provides:
 - random drop rates,
 - delivery delay ranges.
 
-The failure reasons are explicit:
+The failure
+```mermaid
+ reasons are explicit:
 
 ```rust
 pub enum DropReason {
@@ -1686,61 +1683,6 @@ cargo test --test partition -- --nocapture
 cargo test --test chaos -- --nocapture
 cargo test --test sim_smoke -- --nocapture
 ```
-
----
-
-## Where to Add Diagrams
-
-If you want this README to look like a polished systems project page instead of just a Markdown document, add exported SVGs under:
-
-```text
-docs/diagrams/
-```
-
-Recommended files:
-
-- `docs/diagrams/architecture.svg`
-- `docs/diagrams/ready-flow.svg`
-- `docs/diagrams/election.svg`
-- `docs/diagrams/replication.svg`
-- `docs/diagrams/snapshot.svg`
-- `docs/diagrams/runtime-node.svg`
-- `docs/diagrams/cluster-topology.svg`
-
-Suggested placement:
-
-- architecture diagram after [Architecture](#architecture)
-- `Ready` lifecycle after [The `Ready` Contract](#the-ready-contract)
-- election sequence after [Leader Election](#leader-election)
-- append / commit sequence after [Log Replication](#log-replication)
-- snapshot lifecycle after [Snapshots and Log Compaction](#snapshots-and-log-compaction)
-- runtime process diagram after [Real Runtime](#real-runtime)
-- five-node deployment diagram after [Running the Cluster](#running-the-cluster)
-
-The Mermaid blocks already in this README are good stand-ins until you export polished visuals.
-
----
-
-## What Is Not Here Yet
-
-This implementation is serious, but it is not pretending to be finished in every direction.
-
-Still missing:
-
-- `ReadIndex`,
-- leadership transfer,
-- membership changes / joint consensus,
-- a full metrics export story,
-- structured tracing beyond the current runtime counters and logs,
-- richer client session semantics such as deduplicated command IDs replicated through the application layer.
-
-That is a strong place to be. The hard part is already done correctly:
-
-- the core shape is right,
-- the simulator is right,
-- the runtime is real,
-- crash/restart and compaction exist,
-- the cluster actually behaves like Raft.
 
 ---
 

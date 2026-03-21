@@ -229,7 +229,7 @@ where
         &self.network
     }
 
-    pub(crate) fn network_mut(&mut self) -> &mut SimNetwork {
+    pub(crate) fn _network_mut(&mut self) -> &mut SimNetwork {
         &mut self.network
     }
 

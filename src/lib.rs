@@ -1,6 +1,7 @@
 pub mod core;
 pub mod entry;
 pub mod message;
+pub mod runtime;
 pub mod sim;
 pub mod sm;
 pub mod storage;

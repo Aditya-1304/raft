@@ -347,7 +347,7 @@ where
                 self.recorder.record_event(SimEvent::ProposalResult {
                     at: self.now,
                     node_id: *node_id,
-                    result: result.clone(),
+                    result,
                 });
 
                 SimStepOutcome::Proposed { result }

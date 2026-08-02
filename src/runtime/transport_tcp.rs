@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Cursor, Read, Write},
     marker::PhantomData,
     net::{SocketAddr, TcpListener, TcpStream},
@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    entry::LogEntry,
+    entry::{EntryPayload, LogEntry},
     message::{
         AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
         InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
@@ -17,7 +17,7 @@ use crate::{
     },
     storage::codec::{CommandCodec, SnapshotCodec},
     traits::transport::Transport,
-    types::{NodeId, Snapshot},
+    types::{ConfChange, ConfChangeKind, ConfState, NodeId},
 };
 
 const TAG_PREVOTE_REQUEST: u8 = 1;
@@ -28,6 +28,8 @@ const TAG_APPEND_ENTRIES_REQUEST: u8 = 5;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 6;
 const TAG_INSTALL_SNAPSHOT_REQUEST: u8 = 7;
 const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
+const MAX_WIRE_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WIRE_APPEND_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpTransportConfig {
@@ -73,8 +75,7 @@ where
     SC: SnapshotCodec<S>,
 {
     command_codec: CC,
-    snapshot_codec: SC,
-    _marker: PhantomData<(C, S)>,
+    _marker: PhantomData<(C, S, SC)>,
 }
 
 impl<C, S, CC, SC> TcpTransport<C, S, CC, SC>
@@ -204,16 +205,14 @@ where
     CC: CommandCodec<C> + Clone + Send + Sync + 'static,
     SC: SnapshotCodec<S> + Clone + Send + Sync + 'static,
 {
-    fn send(&self, msg: Envelope<C, S>) {
-        if let Err(err) = self.try_send(msg) {
-            eprintln!("tcp transport send failed: {err}");
-        }
+    type Error = io::Error;
+
+    fn send(&self, msg: Envelope<C, S>) -> io::Result<()> {
+        self.try_send(msg)
     }
 
-    fn send_batch(&self, msg: Vec<Envelope<C, S>>) {
-        if let Err(err) = self.try_send_batch(msg) {
-            eprintln!("tcp transport batch send failed: {err}");
-        }
+    fn send_batch(&self, msg: Vec<Envelope<C, S>>) -> io::Result<()> {
+        self.try_send_batch(msg)
     }
 }
 
@@ -222,10 +221,9 @@ where
     CC: CommandCodec<C>,
     SC: SnapshotCodec<S>,
 {
-    pub fn new(command_codec: CC, snapshot_codec: SC) -> Self {
+    pub fn new(command_codec: CC, _snapshot_codec: SC) -> Self {
         Self {
             command_codec,
-            snapshot_codec,
             _marker: PhantomData,
         }
     }
@@ -392,7 +390,16 @@ where
         for entry in &request.entries {
             push_u64(buf, entry.index);
             push_u64(buf, entry.term);
-            push_bytes(buf, &self.command_codec.encode(&entry.command)?);
+            match &entry.payload {
+                EntryPayload::Normal(command) => {
+                    push_u8(buf, 0);
+                    push_bytes(buf, &self.command_codec.encode(command)?);
+                }
+                EntryPayload::Configuration(change) => {
+                    push_u8(buf, 1);
+                    encode_conf_change(buf, change);
+                }
+            }
         }
 
         Ok(())
@@ -407,19 +414,43 @@ where
         let prev_log_index = read_u64(cursor)?;
         let prev_log_term = read_u64(cursor)?;
         let leader_commit = read_u64(cursor)?;
-        let entry_count = read_u64(cursor)? as usize;
+        let entry_count = usize::try_from(read_u64(cursor)?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "entry count exceeds usize"))?;
+        if entry_count > MAX_WIRE_APPEND_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AppendEntries count {entry_count} exceeds wire limit"),
+            ));
+        }
 
         let mut entries = Vec::with_capacity(entry_count);
 
         for _ in 0..entry_count {
             let index = read_u64(cursor)?;
             let term = read_u64(cursor)?;
-            let command = self.command_codec.decode(&read_bytes(cursor)?)?;
+            let (payload, encoded_len) = match read_u8(cursor)? {
+                0 => {
+                    let bytes = read_bytes(cursor)?;
+                    let encoded_len = bytes.len();
+                    (
+                        EntryPayload::Normal(self.command_codec.decode(&bytes)?),
+                        encoded_len,
+                    )
+                }
+                1 => (EntryPayload::Configuration(decode_conf_change(cursor)?), 24),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid entry payload tag: {other}"),
+                    ));
+                }
+            };
 
             entries.push(LogEntry {
                 index,
                 term,
-                command,
+                encoded_len,
+                payload,
             });
         }
 
@@ -461,9 +492,12 @@ where
     ) -> io::Result<()> {
         push_u64(buf, request.term);
         push_u64(buf, request.leader_id);
-        push_u64(buf, request.snapshot.last_included_index);
-        push_u64(buf, request.snapshot.last_included_term);
-        push_bytes(buf, &self.snapshot_codec.encode(&request.snapshot.data)?);
+        push_u64(buf, request.metadata.snapshot_id);
+        push_u64(buf, request.metadata.last_included_index);
+        push_u64(buf, request.metadata.last_included_term);
+        encode_conf_state(buf, &request.metadata.conf_state);
+        push_u64(buf, request.metadata.size_bytes);
+        buf.extend_from_slice(&request.metadata.checksum);
         Ok(())
     }
 
@@ -473,19 +507,26 @@ where
     ) -> io::Result<InstallSnapshotRequest<S>> {
         let term = read_u64(cursor)?;
         let leader_id = read_u64(cursor)?;
+        let snapshot_id = read_u64(cursor)?;
         let last_included_index = read_u64(cursor)?;
         let last_included_term = read_u64(cursor)?;
-        let data = self.snapshot_codec.decode(&read_bytes(cursor)?)?;
+        let conf_state = decode_conf_state(cursor)?;
+        let size_bytes = read_u64(cursor)?;
+        let mut checksum = [0_u8; 32];
+        cursor.read_exact(&mut checksum)?;
 
-        Ok(InstallSnapshotRequest {
+        Ok(InstallSnapshotRequest::new(
             term,
             leader_id,
-            snapshot: Snapshot {
+            crate::types::SnapshotMetadata {
+                snapshot_id,
                 last_included_index,
                 last_included_term,
-                data,
+                conf_state,
+                size_bytes,
+                checksum,
             },
-        })
+        ))
     }
 
     fn encode_install_snapshot_response(
@@ -590,7 +631,14 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
         read += n;
     }
 
-    let len = u64::from_be_bytes(len_buf) as usize;
+    let len = usize::try_from(u64::from_be_bytes(len_buf))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds usize"))?;
+    if len > MAX_WIRE_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Raft frame length {len} exceeds {MAX_WIRE_FRAME_BYTES}"),
+        ));
+    }
     let mut payload = vec![0_u8; len];
     stream.read_exact(&mut payload)?;
     Ok(Some(payload))
@@ -623,6 +671,31 @@ fn push_option_u64(buf: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
+fn encode_replica_set(buf: &mut Vec<u8>, values: &BTreeSet<NodeId>) {
+    push_u64(buf, values.len() as u64);
+    for value in values {
+        push_u64(buf, *value);
+    }
+}
+
+fn encode_conf_state(buf: &mut Vec<u8>, conf_state: &ConfState) {
+    push_u64(buf, conf_state.version);
+    encode_replica_set(buf, &conf_state.voters);
+    encode_replica_set(buf, &conf_state.learners);
+    encode_replica_set(buf, &conf_state.outgoing_voters);
+}
+
+fn encode_conf_change(buf: &mut Vec<u8>, change: &ConfChange) {
+    push_u64(buf, change.expected_version);
+    let (tag, replica_id) = match change.kind {
+        ConfChangeKind::AddLearner(replica_id) => (0, replica_id),
+        ConfChangeKind::PromoteLearner(replica_id) => (1, replica_id),
+        ConfChangeKind::RemoveReplica(replica_id) => (2, replica_id),
+    };
+    push_u8(buf, tag);
+    push_u64(buf, replica_id);
+}
+
 fn read_u8(cursor: &mut Cursor<&[u8]>) -> io::Result<u8> {
     let mut buf = [0_u8; 1];
     cursor.read_exact(&mut buf)?;
@@ -647,7 +720,18 @@ fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
 }
 
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
-    let len = read_u64(cursor)? as usize;
+    let len = usize::try_from(read_u64(cursor)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "byte field length exceeds usize",
+        )
+    })?;
+    if len > MAX_WIRE_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("byte field length {len} exceeds {MAX_WIRE_FRAME_BYTES}"),
+        ));
+    }
     let mut buf = vec![0_u8; len];
     cursor.read_exact(&mut buf)?;
     Ok(buf)
@@ -662,4 +746,50 @@ fn read_option_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<Option<u64>> {
             format!("invalid option tag: {other}"),
         )),
     }
+}
+
+fn decode_replica_set(cursor: &mut Cursor<&[u8]>) -> io::Result<BTreeSet<NodeId>> {
+    let count = read_u64(cursor)?;
+    let mut values = BTreeSet::new();
+    for _ in 0..count {
+        values.insert(read_u64(cursor)?);
+    }
+    Ok(values)
+}
+
+fn decode_conf_state(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfState> {
+    let conf_state = ConfState {
+        version: read_u64(cursor)?,
+        voters: decode_replica_set(cursor)?,
+        learners: decode_replica_set(cursor)?,
+        outgoing_voters: decode_replica_set(cursor)?,
+    };
+    conf_state.validate().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid wire ConfState: {err:?}"),
+        )
+    })?;
+    Ok(conf_state)
+}
+
+fn decode_conf_change(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfChange> {
+    let expected_version = read_u64(cursor)?;
+    let tag = read_u8(cursor)?;
+    let replica_id = read_u64(cursor)?;
+    let kind = match tag {
+        0 => ConfChangeKind::AddLearner(replica_id),
+        1 => ConfChangeKind::PromoteLearner(replica_id),
+        2 => ConfChangeKind::RemoveReplica(replica_id),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid configuration change tag: {other}"),
+            ));
+        }
+    };
+    Ok(ConfChange {
+        expected_version,
+        kind,
+    })
 }

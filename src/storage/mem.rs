@@ -1,12 +1,13 @@
 use crate::{
     entry::LogEntry,
     traits::{log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore},
-    types::{HardState, LogIndex, Snapshot, Term},
+    types::{ConfState, HardState, LogIndex, Snapshot, Term},
 };
 
 #[derive(Debug, Clone)]
 pub struct MemStorage<C, S> {
     hard_state: HardState,
+    conf_state: Option<ConfState>,
     entries: Vec<LogEntry<C>>,
     snapshot: Option<Snapshot<S>>,
     snapshot_index: LogIndex,
@@ -17,6 +18,7 @@ impl<C, S> Default for MemStorage<C, S> {
     fn default() -> Self {
         Self {
             hard_state: HardState::default(),
+            conf_state: None,
             entries: Vec::new(),
             snapshot: None,
             snapshot_index: 0,
@@ -49,7 +51,7 @@ impl<C, S> MemStorage<C, S> {
         self.entries
             .first()
             .map(|entry| entry.index)
-            .unwrap_or(self.snapshot_index + 1)
+            .unwrap_or(self.snapshot_index.saturating_add(1))
     }
 
     fn last_log_index(&self) -> LogIndex {
@@ -78,6 +80,14 @@ impl<C, S> StableStore for MemStorage<C, S> {
 
     fn set_hard_state(&mut self, hs: HardState) {
         self.hard_state = hs;
+    }
+
+    fn conf_state(&self) -> Option<ConfState> {
+        self.conf_state.clone()
+    }
+
+    fn set_conf_state(&mut self, conf_state: ConfState) {
+        self.conf_state = Some(conf_state);
     }
 }
 
@@ -152,7 +162,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
         }
 
         let first_new_index = entries[0].index;
-        let expected_next = self.last_log_index() + 1;
+        let expected_next = self.last_log_index().saturating_add(1);
 
         if first_new_index > expected_next {
             panic!(
@@ -192,7 +202,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
             return;
         };
 
-        let remaining = self.entries(through + 1, usize::MAX);
+        let remaining = self.entries(through.saturating_add(1), usize::MAX);
         self.entries = remaining;
         self.set_snapshot_boundary(through, term);
     }
@@ -212,7 +222,7 @@ impl<C: Clone, S> LogStore<C> for MemStorage<C, S> {
         );
 
         self.entries = if keep_suffix {
-            self.entries(last_included_index + 1, usize::MAX)
+            self.entries(last_included_index.saturating_add(1), usize::MAX)
         } else {
             Vec::new()
         };

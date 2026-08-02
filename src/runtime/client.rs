@@ -268,10 +268,10 @@ where
     fn initial_candidates(&self) -> VecDeque<NodeId> {
         let mut ordered = VecDeque::new();
 
-        if let Some(leader_hint) = self.leader_hint {
-            if self.peers.contains_key(&leader_hint) {
-                ordered.push_back(leader_hint);
-            }
+        if let Some(leader_hint) = self.leader_hint
+            && self.peers.contains_key(&leader_hint)
+        {
+            ordered.push_back(leader_hint);
         }
 
         for &node_id in self.peers.keys() {

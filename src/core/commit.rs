@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use crate::{
-    entry::LogEntry,
+    entry::{EntryPayload, LogEntry},
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{LogIndex, Role},
 };
@@ -22,31 +24,27 @@ where
             return;
         };
 
-        let mut matched = Vec::with_capacity(leader_state.progress.len() + 1);
-        matched.push(self.last_log_index());
-        matched.extend(
-            leader_state
-                .progress
-                .values()
-                .map(|progress| progress.match_index),
-        );
-        matched.sort_unstable();
+        for candidate_commit in (self.commit_index.saturating_add(1)..=self.last_log_index()).rev()
+        {
+            if self.log.term(candidate_commit) != Some(self.current_term()) {
+                continue;
+            }
 
-        let candidate_commit = matched[matched.len() / 2];
+            let mut replicated = HashSet::new();
+            replicated.insert(self.id);
+            replicated.extend(
+                leader_state
+                    .progress
+                    .iter()
+                    .filter(|(_, progress)| progress.match_index >= candidate_commit)
+                    .map(|(replica_id, _)| *replica_id),
+            );
 
-        if candidate_commit <= self.commit_index {
-            return;
+            if self.conf_state.has_quorum(&replicated) {
+                self.commit_to(candidate_commit);
+                return;
+            }
         }
-
-        let Some(candidate_term) = self.log.term(candidate_commit) else {
-            return;
-        };
-
-        if candidate_term != self.current_term() {
-            return;
-        }
-
-        self.commit_to(candidate_commit);
     }
 
     pub(crate) fn commit_to(&mut self, new_commit: LogIndex) {
@@ -56,15 +54,26 @@ where
             return;
         }
 
-        let start = self.commit_index + 1;
-        let count = (new_commit - start + 1) as usize;
+        let start = self.commit_index.saturating_add(1);
+        let Ok(count) = usize::try_from(new_commit - start + 1) else {
+            return;
+        };
         let newly_committed: Vec<LogEntry<C>> = self.log.entries(start, count);
 
         self.commit_index = new_commit;
+        self.refresh_uncommitted_bytes();
 
-        let mut hs = self.stable.hard_state();
+        let mut hs = self.hard_state.clone();
         hs.commit = new_commit;
         self.set_hard_state(hs);
+
+        for entry in &newly_committed {
+            if let EntryPayload::Configuration(change) = &entry.payload
+                && let Ok(next) = self.conf_state.apply(change)
+            {
+                self.install_conf_state(next);
+            }
+        }
 
         self.committed.extend(newly_committed);
     }

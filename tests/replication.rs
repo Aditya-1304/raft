@@ -30,11 +30,7 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 
     let seeded_entries: Vec<LogEntry<TestCmd>> = entries
         .iter()
-        .map(|(index, term, command)| LogEntry {
-            index: *index,
-            term: *term,
-            command: *command,
-        })
+        .map(|(index, term, command)| LogEntry::normal(*index, *term, *command))
         .collect();
 
     log.append(&seeded_entries);
@@ -58,7 +54,19 @@ fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
 }
 
 fn drain_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
-    node.ready().messages
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready.messages
+}
+
+fn take_ready(node: &mut TestNode) -> raft::core::ready::Ready<TestCmd, ()> {
+    let ready = node.ready().expect("expected Ready generation");
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready
 }
 
 fn flush_cluster(nodes: &mut [TestNode; 3], max_rounds: usize) {
@@ -99,7 +107,7 @@ fn majority_replication() {
     let proposed_index = nodes[0].propose(10).unwrap();
     assert_eq!(proposed_index, 1);
 
-    let ready = nodes[0].ready();
+    let ready = take_ready(&mut nodes[0]);
     assert_eq!(ready.entries_to_persist.len(), 1);
     assert_eq!(ready.entries_to_persist[0].index, 1);
     assert_eq!(ready.entries_to_persist[0].term, nodes[0].current_term());
@@ -132,7 +140,7 @@ fn follower_catch_up() {
     elect_leader(&mut nodes, 0);
 
     nodes[0].propose(10).unwrap();
-    let first_ready = nodes[0].ready();
+    let first_ready = take_ready(&mut nodes[0]);
 
     let only_n2: Vec<_> = first_ready
         .messages
@@ -147,6 +155,10 @@ fn follower_catch_up() {
     assert_eq!(nodes[2].last_log_index(), 0);
 
     nodes[0].propose(20).unwrap();
+    // The first append to node 3 was intentionally dropped. The bounded
+    // inflight window is released when the next heartbeat obtains a rejection
+    // carrying node 3's durable conflict index.
+    nodes[0].tick(HEARTBEAT_INTERVAL);
     flush_cluster(&mut nodes, 20);
 
     assert_eq!(nodes[0].last_log_index(), 2);

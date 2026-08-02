@@ -1,5 +1,7 @@
 use std::{fmt, io, time::Duration};
 
+use crate::core::ready::AdvanceError;
+
 pub mod client;
 pub mod server;
 pub mod ticker_wall;
@@ -44,6 +46,9 @@ pub struct RuntimeStats {
 pub enum RuntimeError {
     Io(io::Error),
     InboundClosed,
+    Advance(AdvanceError),
+    Transport(String),
+    Application(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -51,6 +56,9 @@ impl fmt::Display for RuntimeError {
         match self {
             RuntimeError::Io(err) => write!(f, "runtime I/O error: {err}"),
             RuntimeError::InboundClosed => write!(f, "runtime inbound channel closed"),
+            RuntimeError::Advance(err) => write!(f, "invalid Raft host acknowledgement: {err:?}"),
+            RuntimeError::Transport(err) => write!(f, "Raft transport failed: {err}"),
+            RuntimeError::Application(err) => write!(f, "state-machine operation failed: {err}"),
         }
     }
 }
@@ -60,7 +68,15 @@ impl std::error::Error for RuntimeError {
         match self {
             RuntimeError::Io(err) => Some(err),
             RuntimeError::InboundClosed => None,
+            RuntimeError::Advance(_) => None,
+            RuntimeError::Transport(_) | RuntimeError::Application(_) => None,
         }
+    }
+}
+
+impl From<AdvanceError> for RuntimeError {
+    fn from(err: AdvanceError) -> Self {
+        RuntimeError::Advance(err)
     }
 }
 

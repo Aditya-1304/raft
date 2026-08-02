@@ -467,10 +467,10 @@ where
     let last_log_index = raft.last_log_index();
     let snapshot_index = first_log_index.saturating_sub(1);
 
-    if snapshot_index > 0 {
-        if let Some(snapshot_term) = raft.log.term(snapshot_index) {
-            known_terms.insert(snapshot_index, snapshot_term);
-        }
+    if snapshot_index > 0
+        && let Some(snapshot_term) = raft.log.term(snapshot_index)
+    {
+        known_terms.insert(snapshot_index, snapshot_term);
     }
 
     if first_log_index <= last_log_index {

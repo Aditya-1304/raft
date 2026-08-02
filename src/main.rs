@@ -191,7 +191,7 @@ enum AdminRequest {
 
 #[derive(Debug, Clone)]
 enum AdminResponse {
-    Status(NodeStatus),
+    Status(Box<NodeStatus>),
     Accepted {
         node_id: NodeId,
         leader_id: Option<NodeId>,
@@ -242,15 +242,16 @@ impl CounterStateMachine {
 
 impl StateMachine<DemoCommand> for CounterStateMachine {
     type Output = CounterOutput;
+    type Error = std::convert::Infallible;
 
-    fn apply(&mut self, index: LogIndex, cmd: &DemoCommand) -> Self::Output {
+    fn apply(&mut self, index: LogIndex, cmd: &DemoCommand) -> Result<Self::Output, Self::Error> {
         self.last_applied = index;
         self.total = self.total.saturating_add(*cmd);
 
-        CounterOutput {
+        Ok(CounterOutput {
             delta: *cmd,
             total: self.total,
-        }
+        })
     }
 }
 
@@ -264,9 +265,10 @@ impl SnapshotableStateMachine<DemoCommand> for CounterStateMachine {
         }
     }
 
-    fn restore(&mut self, snapshot: Self::Snapshot) {
+    fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error> {
         self.total = snapshot.total;
         self.last_applied = snapshot.last_applied;
+        Ok(())
     }
 
     fn last_applied(&self) -> LogIndex {
@@ -663,7 +665,9 @@ fn handle_admin_request(
 ) -> io::Result<bool> {
     match request {
         AdminRequest::Status { reply_to } => {
-            let _ = reply_to.send(AdminResponse::Status(snapshot_local_status(member, server)));
+            let _ = reply_to.send(AdminResponse::Status(Box::new(snapshot_local_status(
+                member, server,
+            ))));
             Ok(false)
         }
         AdminRequest::Propose { command, reply_to } => {
@@ -685,7 +689,17 @@ fn handle_admin_request(
                             log_index,
                         }
                     }
-                    Err(ProposeError::NotLeader) => AdminResponse::NotLeader {
+                    Err(
+                        ProposeError::NotLeader
+                        | ProposeError::ConfigurationChangePending
+                        | ProposeError::InvalidConfiguration(_)
+                        | ProposeError::LearnerNotCaughtUp { .. }
+                        | ProposeError::CannotRemoveLeader
+                        | ProposeError::ProposalTooLarge { .. }
+                        | ProposeError::UncommittedEntriesFull { .. }
+                        | ProposeError::UncommittedBytesFull { .. }
+                        | ProposeError::LogIndexExhausted,
+                    ) => AdminResponse::NotLeader {
                         node_id: member.node_id,
                         leader_id: server.raft().leader_id(),
                     },
@@ -1082,10 +1096,10 @@ fn candidate_order(
         ordered.push(target_node);
     }
 
-    if let Some(leader_hint) = leader_hint {
-        if !ordered.contains(&leader_hint) {
-            ordered.push(leader_hint);
-        }
+    if let Some(leader_hint) = leader_hint
+        && !ordered.contains(&leader_hint)
+    {
+        ordered.push(leader_hint);
     }
 
     for node_id in cluster.ordered_ids() {
@@ -1577,6 +1591,18 @@ fn runtime_error_to_io(err: RuntimeError, node_id: NodeId) -> io::Error {
         RuntimeError::InboundClosed => io::Error::new(
             io::ErrorKind::BrokenPipe,
             format!("node {node_id} inbound transport channel closed"),
+        ),
+        RuntimeError::Advance(err) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("node {node_id} rejected a Raft host acknowledgement: {err:?}"),
+        ),
+        RuntimeError::Transport(err) => io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("node {node_id} Raft transport failed: {err}"),
+        ),
+        RuntimeError::Application(err) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("node {node_id} state-machine operation failed: {err}"),
         ),
     }
 }

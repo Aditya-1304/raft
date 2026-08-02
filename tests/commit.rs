@@ -30,11 +30,7 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 
     let seeded_entries: Vec<LogEntry<TestCmd>> = entries
         .iter()
-        .map(|(index, term, command)| LogEntry {
-            index: *index,
-            term: *term,
-            command: *command,
-        })
+        .map(|(index, term, command)| LogEntry::normal(*index, *term, *command))
         .collect();
 
     log.append(&seeded_entries);
@@ -58,11 +54,18 @@ fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
 }
 
 fn take_ready(node: &mut TestNode) -> Ready<TestCmd, ()> {
-    node.ready()
+    let ready = node.ready().expect("expected Ready generation");
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready
 }
 
 fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
-    let ready = node.ready();
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
     assert!(
         ready.committed_entries.is_empty(),
         "unexpected committed entries during message-only drain"
@@ -153,9 +156,12 @@ fn majority_commits() {
     assert_eq!(nodes[0].hard_state().commit, 1);
     assert_eq!(leader_commit_ready.committed_entries.len(), 1);
     assert_eq!(leader_commit_ready.committed_entries[0].index, 1);
-    assert_eq!(leader_commit_ready.committed_entries[0].command, 10);
+    assert_eq!(
+        leader_commit_ready.committed_entries[0].command(),
+        Some(&10)
+    );
 
-    nodes[0].advance(1);
+    nodes[0].advance_applied(1).unwrap();
 }
 
 #[test]
@@ -205,7 +211,10 @@ fn old_term_entry_commits_only_after_current_term_entry() {
     assert_eq!(leader_commit_ready.committed_entries[0].term, 1);
     assert_eq!(leader_commit_ready.committed_entries[1].index, 2);
     assert_eq!(leader_commit_ready.committed_entries[1].term, 2);
-    assert_eq!(leader_commit_ready.committed_entries[1].command, 20);
+    assert_eq!(
+        leader_commit_ready.committed_entries[1].command(),
+        Some(&20)
+    );
 
-    nodes[0].advance(2);
+    nodes[0].advance_applied(2).unwrap();
 }

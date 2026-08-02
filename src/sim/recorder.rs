@@ -164,34 +164,35 @@ impl<C, S> SimRecorder<C, S> {
                 commit_index: node.commit_index(),
             };
 
-            if let Some(previous) = self.previous.get(&node_id) {
-                if !previous.crashed && !current.crashed {
-                    if previous.role != current.role {
-                        self.events.push(SimEvent::RoleChanged {
-                            at,
-                            node_id,
-                            from: previous.role,
-                            to: current.role,
-                        });
-                    }
+            if let Some(previous) = self.previous.get(&node_id)
+                && !previous.crashed
+                && !current.crashed
+            {
+                if previous.role != current.role {
+                    self.events.push(SimEvent::RoleChanged {
+                        at,
+                        node_id,
+                        from: previous.role,
+                        to: current.role,
+                    });
+                }
 
-                    if previous.term != current.term {
-                        self.events.push(SimEvent::TermChanged {
-                            at,
-                            node_id,
-                            from: previous.term,
-                            to: current.term,
-                        });
-                    }
+                if previous.term != current.term {
+                    self.events.push(SimEvent::TermChanged {
+                        at,
+                        node_id,
+                        from: previous.term,
+                        to: current.term,
+                    });
+                }
 
-                    if current.commit_index > previous.commit_index {
-                        self.events.push(SimEvent::CommitAdvanced {
-                            at,
-                            node_id,
-                            from: previous.commit_index,
-                            to: current.commit_index,
-                        });
-                    }
+                if current.commit_index > previous.commit_index {
+                    self.events.push(SimEvent::CommitAdvanced {
+                        at,
+                        node_id,
+                        from: previous.commit_index,
+                        to: current.commit_index,
+                    });
                 }
             }
 

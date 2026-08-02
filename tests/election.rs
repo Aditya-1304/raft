@@ -21,7 +21,12 @@ fn new_node(id: u64, peers: Vec<u64>, election_timeout: u64) -> TestNode {
 }
 
 fn take_messages(node: &mut TestNode) -> Vec<Envelope<(), ()>> {
-    node.ready().messages
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready.messages
 }
 
 fn tick_to_timeout(node: &mut TestNode) {

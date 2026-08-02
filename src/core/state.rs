@@ -13,20 +13,20 @@ where
     SS: StableStore,
 {
     pub fn current_term(&self) -> Term {
-        self.stable.hard_state().current_term
+        self.hard_state.current_term
     }
 
     pub fn voted_for(&self) -> Option<NodeId> {
-        self.stable.hard_state().voted_for
+        self.hard_state.voted_for
     }
 
     pub(crate) fn set_hard_state(&mut self, hs: HardState) {
-        self.stable.set_hard_state(hs.clone());
+        self.hard_state = hs.clone();
         self.pending_hard_state = Some(hs);
     }
 
     pub(crate) fn set_current_term(&mut self, term: Term) {
-        let mut hs = self.stable.hard_state();
+        let mut hs = self.hard_state.clone();
 
         if term <= hs.current_term {
             return;
@@ -38,7 +38,7 @@ where
     }
 
     pub(crate) fn set_voted_for(&mut self, voted_for: Option<NodeId>) {
-        let mut hs = self.stable.hard_state();
+        let mut hs = self.hard_state.clone();
         hs.voted_for = voted_for;
         self.set_hard_state(hs);
     }

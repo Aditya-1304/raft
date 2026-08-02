@@ -5,7 +5,7 @@ use crate::{
         InstallSnapshotResponse, Message,
     },
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, NodeId, Role, Term},
+    types::{LogIndex, NodeId, ProgressMode, Role, Term},
 };
 
 use super::node::RaftNode;
@@ -67,14 +67,23 @@ where
             return;
         }
 
-        let Some(next_index) = self
+        let Some(progress) = self
             .leader_state
             .as_ref()
             .and_then(|leader| leader.progress.get(&to))
-            .map(|progress| progress.next_index)
+            .cloned()
         else {
             return;
         };
+        let next_index = progress.next_index;
+
+        if progress.mode == ProgressMode::Snapshot
+            || progress.inflight_batches >= self.limits.max_inflight_append_batches
+            || progress.inflight_bytes >= self.limits.max_inflight_append_bytes
+            || (progress.mode == ProgressMode::Probe && progress.inflight_batches > 0)
+        {
+            return;
+        }
 
         if self.maybe_send_snapshot_to(to, next_index) {
             return;
@@ -87,12 +96,14 @@ where
             self.log.term(prev_log_index).unwrap_or(0)
         };
 
+        let entries = self.bounded_entries(next_index);
+        let batch_bytes: usize = entries.iter().map(|entry| entry.encoded_len).sum();
         let request = AppendEntriesRequest {
             term: self.current_term(),
             leader_id: self.id,
             prev_log_index,
             prev_log_term,
-            entries: self.log.entries(next_index, usize::MAX),
+            entries,
             leader_commit: self.commit_index,
         };
 
@@ -101,6 +112,16 @@ where
             to,
             msg: Message::AppendEntries(request),
         });
+
+        if batch_bytes > 0
+            && let Some(progress) = self
+                .leader_state
+                .as_mut()
+                .and_then(|leader| leader.progress.get_mut(&to))
+        {
+            progress.inflight_batches = progress.inflight_batches.saturating_add(1);
+            progress.inflight_bytes = progress.inflight_bytes.saturating_add(batch_bytes);
+        }
     }
 
     pub(crate) fn handle_append_entries_request(
@@ -109,7 +130,7 @@ where
         request: AppendEntriesRequest<C>,
     ) {
         if request.term < self.current_term() {
-            self.reject_append_entries(from, None, self.last_log_index() + 1);
+            self.reject_append_entries(from, None, self.last_log_index().saturating_add(1));
             return;
         }
 
@@ -162,15 +183,22 @@ where
                 return;
             };
 
+            progress.inflight_batches = 0;
+            progress.inflight_bytes = 0;
+
             if response.success {
                 let acknowledged = response.match_index.unwrap_or(progress.match_index);
                 progress.match_index = progress.match_index.max(acknowledged);
-                progress.next_index = progress.next_index.max(progress.match_index + 1);
+                progress.next_index = progress
+                    .next_index
+                    .max(progress.match_index.saturating_add(1));
+                progress.mode = ProgressMode::Replicate;
                 progress.next_index <= leader_last_index
             } else {
                 let fallback_next = progress.next_index.saturating_sub(1).max(1);
                 let candidate_next = retry_next.unwrap_or(fallback_next).max(1);
                 progress.next_index = progress.next_index.min(candidate_next);
+                progress.mode = ProgressMode::Probe;
                 true
             }
         };
@@ -197,9 +225,19 @@ where
         self.become_follower(request.term, Some(request.leader_id));
         self.reset_election_timer();
 
-        let snapshot_index = request.snapshot.last_included_index;
-        self.stage_snapshot(request.snapshot);
-        self.accept_install_snapshot(from, snapshot_index);
+        if self.is_snapshot_stale(
+            request.metadata.last_included_index,
+            request.metadata.last_included_term,
+        ) {
+            self.reject_install_snapshot(from);
+            return;
+        }
+
+        // The host now owns image transfer. Raft emits only immutable metadata
+        // and waits for `complete_snapshot_install` before acknowledging.
+        self.snapshot_install_source = Some(from);
+        self.snapshot_install_expected = Some(request.metadata.clone());
+        self.pending_snapshot_install = Some(request.metadata);
     }
 
     pub(crate) fn handle_install_snapshot_response_from(
@@ -232,11 +270,17 @@ where
             };
 
             if !response.success {
+                progress.mode = ProgressMode::Probe;
                 return;
             }
 
+            progress.mode = ProgressMode::Probe;
+            progress.inflight_batches = 0;
+            progress.inflight_bytes = 0;
             progress.match_index = progress.match_index.max(response.last_included_index);
-            progress.next_index = progress.next_index.max(response.last_included_index + 1);
+            progress.next_index = progress
+                .next_index
+                .max(response.last_included_index.saturating_add(1));
             progress.next_index <= self.last_log_index()
         };
 
@@ -259,14 +303,42 @@ where
         self.outbox.push(Envelope {
             from: self.id,
             to,
-            msg: Message::InstallSnapshot(InstallSnapshotRequest {
-                term: self.current_term(),
-                leader_id: self.id,
-                snapshot,
-            }),
+            msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+                self.current_term(),
+                self.id,
+                snapshot.metadata(),
+            )),
         });
 
+        if let Some(progress) = self
+            .leader_state
+            .as_mut()
+            .and_then(|leader| leader.progress.get_mut(&to))
+        {
+            progress.mode = ProgressMode::Snapshot;
+            progress.inflight_batches = 0;
+            progress.inflight_bytes = 0;
+        }
+
         true
+    }
+
+    fn bounded_entries(&self, from: LogIndex) -> Vec<LogEntry<C>> {
+        let candidates = self.log.entries(from, self.limits.max_append_entries);
+        let mut bytes = 0_usize;
+        let mut bounded = Vec::with_capacity(candidates.len());
+
+        for entry in candidates {
+            let next_bytes = bytes.saturating_add(entry.encoded_len);
+            if next_bytes > self.limits.max_append_bytes
+                || next_bytes > self.limits.max_inflight_append_bytes
+            {
+                break;
+            }
+            bytes = next_bytes;
+            bounded.push(entry);
+        }
+        bounded
     }
 
     fn accept_append_entries(&mut self, to: NodeId, match_index: LogIndex) {
@@ -302,7 +374,7 @@ where
         });
     }
 
-    fn accept_install_snapshot(&mut self, to: NodeId, last_included_index: LogIndex) {
+    pub(crate) fn accept_install_snapshot(&mut self, to: NodeId, last_included_index: LogIndex) {
         self.outbox.push(Envelope {
             from: self.id,
             to,
@@ -336,7 +408,7 @@ where
         }
 
         let Some(local_term) = self.log.term(prev_log_index) else {
-            return Err((None, self.last_log_index() + 1));
+            return Err((None, self.last_log_index().saturating_add(1)));
         };
 
         if local_term == prev_log_term {
@@ -388,6 +460,8 @@ where
             let suffix = &entries[offset..];
             self.log.append(suffix);
             self.pending_entries.extend(suffix.iter().cloned());
+            self.refresh_pending_conf_change();
+            self.refresh_uncommitted_bytes();
         }
     }
 
@@ -400,10 +474,10 @@ where
     }
 
     fn backtrack_next_index(&self, response: &AppendEntriesResponse) -> Option<LogIndex> {
-        if let Some(conflict_term) = response.conflict_term {
-            if let Some(last_index) = self.last_index_of_term(conflict_term) {
-                return Some(last_index + 1);
-            }
+        if let Some(conflict_term) = response.conflict_term
+            && let Some(last_index) = self.last_index_of_term(conflict_term)
+        {
+            return Some(last_index.saturating_add(1));
         }
 
         response.conflict_index

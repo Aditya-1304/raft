@@ -1,6 +1,8 @@
+use std::marker::PhantomData;
+
 use crate::{
     entry::LogEntry,
-    types::{LogIndex, NodeId, Snapshot, Term},
+    types::{LogIndex, NodeId, SnapshotMetadata, Term},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +56,19 @@ pub struct AppendEntriesResponse {
 pub struct InstallSnapshotRequest<S> {
     pub term: Term,
     pub leader_id: NodeId,
-    pub snapshot: Snapshot<S>,
+    pub metadata: SnapshotMetadata,
+    pub marker: PhantomData<fn() -> S>,
+}
+
+impl<S> InstallSnapshotRequest<S> {
+    pub fn new(term: Term, leader_id: NodeId, metadata: SnapshotMetadata) -> Self {
+        Self {
+            term,
+            leader_id,
+            metadata,
+            marker: PhantomData,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     core::{node::RaftNode, ready::Ready},
+    entry::EntryPayload,
     message::Envelope,
     traits::{
         log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore,
@@ -41,7 +42,9 @@ where
     SS: StableStore,
     Snap: SnapshotStore<S>,
     SM: SnapshotableStateMachine<C, Snapshot = S>,
+    SM::Error: std::fmt::Display,
     Tp: Transport<C, S>,
+    Tp::Error: std::fmt::Display,
     Tk: Ticker,
 {
     raft: RaftNode<C, S, LS, SS>,
@@ -64,7 +67,9 @@ where
     SS: StableStore,
     Snap: SnapshotStore<S>,
     SM: SnapshotableStateMachine<C, Snapshot = S>,
+    SM::Error: std::fmt::Display,
     Tp: Transport<C, S>,
+    Tp::Error: std::fmt::Display,
     Tk: Ticker,
 {
     pub fn new(
@@ -88,6 +93,10 @@ where
         )
     }
 
+    // The standalone runtime keeps its dependencies explicit so the consensus
+    // core remains independent of transport, clocks, storage, and application
+    // concerns. RagnorDB supplies these through its own Multi-Raft driver.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_snapshot_policy(
         raft: RaftNode<C, S, LS, SS>,
         snapshot_store: Snap,
@@ -238,7 +247,9 @@ where
     fn recover_state_machine_from_storage(&mut self) -> RuntimeResult<()> {
         if let Some(snapshot) = self.snapshot_store.latest().cloned() {
             self.raft.restore_snapshot(snapshot.clone());
-            self.state_machine.restore(snapshot.data);
+            self.state_machine
+                .restore(snapshot.data)
+                .map_err(|err| RuntimeError::Application(err.to_string()))?;
             self.stats.snapshots_restored += 1;
         }
 
@@ -246,7 +257,7 @@ where
         let commit_index = self.raft.commit_index();
 
         if commit_index <= already_applied {
-            self.raft.advance(already_applied);
+            self.raft.advance_applied(already_applied)?;
             return Ok(());
         }
 
@@ -270,12 +281,16 @@ where
         let mut applied_through = already_applied;
 
         for entry in entries {
-            self.state_machine.apply(entry.index, &entry.command);
+            if let EntryPayload::Normal(command) = &entry.payload {
+                self.state_machine
+                    .apply(entry.index, command)
+                    .map_err(|err| RuntimeError::Application(err.to_string()))?;
+            }
             applied_through = entry.index;
         }
 
         if applied_through > 0 {
-            self.raft.advance(applied_through);
+            self.raft.advance_applied(applied_through)?;
         }
 
         Ok(())
@@ -308,10 +323,9 @@ where
         let mut made_progress = false;
 
         loop {
-            let ready = self.raft.ready();
-            if ready.is_empty() {
+            let Some(ready) = self.raft.ready() else {
                 break;
-            }
+            };
 
             self.handle_ready(ready)?;
             made_progress = true;
@@ -322,39 +336,61 @@ where
 
     fn handle_ready(&mut self, ready: Ready<C, S>) -> RuntimeResult<()> {
         let Ready {
-            hard_state: _hard_state,
-            entries_to_persist: _entries_to_persist,
+            id,
             snapshot,
             messages,
             committed_entries,
-            soft_state_changed: _soft_state_changed,
+            ..
         } = ready;
 
         let mut applied_through = None;
 
-        if let Some(snapshot) = snapshot {
+        // Snapshot bytes must be published before the corresponding log and
+        // HardState boundary becomes durable.
+        if let Some(snapshot) = snapshot.as_ref() {
             self.snapshot_store.save(snapshot.clone());
+        }
+
+        let pending = self
+            .raft
+            .ready()
+            .expect("the Ready being handled must remain pending until acknowledgement");
+        self.raft.persist_ready_to_embedded_storage(&pending)?;
+        self.raft.advance_persisted(id)?;
+
+        // An installed snapshot is restored before any success response from
+        // this generation is released to the transport.
+        if let Some(snapshot) = snapshot {
             self.raft.restore_snapshot(snapshot.clone());
-            self.state_machine.restore(snapshot.data);
+            self.state_machine
+                .restore(snapshot.data)
+                .map_err(|err| RuntimeError::Application(err.to_string()))?;
             applied_through = Some(self.state_machine.last_applied());
             self.stats.snapshots_restored += 1;
         }
 
         if !messages.is_empty() {
             self.stats.outbound_messages_sent += messages.len() as u64;
-            self.transport.send_batch(messages);
+            self.transport
+                .send_batch(messages)
+                .map_err(|err| RuntimeError::Transport(err.to_string()))?;
         }
 
         for entry in committed_entries {
             let index = entry.index;
-            let output = self.state_machine.apply(index, &entry.command);
-            self.applied_outputs.push_back((index, output));
+            if let EntryPayload::Normal(command) = &entry.payload {
+                let output = self
+                    .state_machine
+                    .apply(index, command)
+                    .map_err(|err| RuntimeError::Application(err.to_string()))?;
+                self.applied_outputs.push_back((index, output));
+            }
             applied_through = Some(index);
             self.stats.committed_entries_applied += 1;
         }
 
         if let Some(index) = applied_through {
-            self.raft.advance(index);
+            self.raft.advance_applied(index)?;
         }
 
         self.maybe_create_local_snapshot()?;
@@ -392,11 +428,12 @@ where
             )
         })?;
 
-        let snapshot = Snapshot {
-            last_included_index: snapshot_index,
-            last_included_term: snapshot_term,
-            data: self.state_machine.snapshot(),
-        };
+        let snapshot = Snapshot::new(
+            snapshot_index,
+            snapshot_term,
+            self.raft.conf_state().clone(),
+            self.state_machine.snapshot(),
+        );
 
         self.snapshot_store.save(snapshot.clone());
         self.raft.restore_snapshot(snapshot);

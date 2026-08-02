@@ -41,18 +41,19 @@ impl MemKv {
 
 impl StateMachine<MemKvCommand> for MemKv {
     type Output = MemKvOutput;
+    type Error = std::convert::Infallible;
 
-    fn apply(&mut self, index: LogIndex, cmd: &MemKvCommand) -> Self::Output {
+    fn apply(&mut self, index: LogIndex, cmd: &MemKvCommand) -> Result<Self::Output, Self::Error> {
         self.last_applied = index;
 
         match cmd {
             MemKvCommand::Put { key, value } => {
                 let old = self.data.insert(key.clone(), value.clone());
-                MemKvOutput::Put { old }
+                Ok(MemKvOutput::Put { old })
             }
             MemKvCommand::Delete { key } => {
                 let old = self.data.remove(key);
-                MemKvOutput::Delete { old }
+                Ok(MemKvOutput::Delete { old })
             }
         }
     }
@@ -68,9 +69,10 @@ impl SnapshotableStateMachine<MemKvCommand> for MemKv {
         }
     }
 
-    fn restore(&mut self, snapshot: Self::Snapshot) {
+    fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error> {
         self.data = snapshot.data;
         self.last_applied = snapshot.last_applied;
+        Ok(())
     }
 
     fn last_applied(&self) -> LogIndex {

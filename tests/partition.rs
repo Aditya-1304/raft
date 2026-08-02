@@ -133,11 +133,11 @@ fn minority_leader_steps_down_and_healed_cluster_converges() {
     for _ in 0..10 {
         sim.advance_time_and_deliver(ELECTION_TIMEOUT, MAX_DELIVERY_STEPS);
 
-        if let Some(leader) = sim.leader() {
-            if leader != old_leader {
-                new_leader = Some(leader);
-                break;
-            }
+        if let Some(leader) = sim.leader()
+            && leader != old_leader
+        {
+            new_leader = Some(leader);
+            break;
         }
     }
 

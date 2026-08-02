@@ -96,11 +96,19 @@ fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
 }
 
 fn take_ready(node: &mut TestNode) -> Ready<TestCmd, ()> {
-    node.ready()
+    let ready = node.ready().expect("expected Ready generation");
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready
 }
 
 fn drain_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
-    node.ready().messages
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready.messages
 }
 
 fn flush_cluster(nodes: &mut [TestNode; 3], max_rounds: usize) {
@@ -157,7 +165,10 @@ fn crash_after_commit_recovers_persisted_state() {
 
     let leader_commit_ready = take_ready(&mut nodes[0]);
     assert_eq!(leader_commit_ready.committed_entries.len(), 1);
-    assert_eq!(leader_commit_ready.committed_entries[0].command, 10);
+    assert_eq!(
+        leader_commit_ready.committed_entries[0].command(),
+        Some(&10)
+    );
     assert_eq!(nodes[0].commit_index(), 1);
     assert_eq!(nodes[0].hard_state().commit, 1);
 
@@ -174,7 +185,7 @@ fn crash_after_commit_recovers_persisted_state() {
     assert_eq!(restarted.last_log_term(), term_before_crash);
 
     let reopened_log = reopen_log(&files[0]);
-    assert_eq!(reopened_log.entry(1).unwrap().command, 10);
+    assert_eq!(reopened_log.entry(1).unwrap().command(), Some(&10));
 }
 
 #[test]
@@ -206,7 +217,7 @@ fn crash_before_commit_preserves_uncommitted_log() {
     assert_eq!(restarted.last_log_term(), term_before_crash);
 
     let reopened_log = reopen_log(&files[0]);
-    assert_eq!(reopened_log.entry(1).unwrap().command, 10);
+    assert_eq!(reopened_log.entry(1).unwrap().command(), Some(&10));
 }
 
 #[test]
@@ -251,5 +262,5 @@ fn full_restart_and_lagging_follower_catches_up() {
     assert_eq!(restarted[2].hard_state().commit, 1);
 
     let node3_log = reopen_log(&files[2]);
-    assert_eq!(node3_log.entry(1).unwrap().command, 10);
+    assert_eq!(node3_log.entry(1).unwrap().command(), Some(&10));
 }

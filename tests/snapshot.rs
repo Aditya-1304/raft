@@ -11,7 +11,7 @@ use raft::{
     message::{Envelope, InstallSnapshotRequest, Message},
     storage::{codec::U64Codec, file::FileSnapshotStore, mem::MemStorage},
     traits::{log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore},
-    types::{HardState, Role, Snapshot},
+    types::{ConfState, HardState, Role, Snapshot},
 };
 
 type TestCmd = u64;
@@ -62,16 +62,16 @@ fn new_node(id: u64, peers: Vec<u64>) -> TestNode {
     )
 }
 
+fn test_conf_state() -> ConfState {
+    ConfState::new(1, [1, 2, 3], []).unwrap()
+}
+
 fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) -> TestNode {
     let mut log = MemStorage::new();
 
     let seeded_entries: Vec<LogEntry<TestCmd>> = entries
         .iter()
-        .map(|(index, term, command)| LogEntry {
-            index: *index,
-            term: *term,
-            command: *command,
-        })
+        .map(|(index, term, command)| LogEntry::normal(*index, *term, *command))
         .collect();
 
     log.append(&seeded_entries);
@@ -88,11 +88,19 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 }
 
 fn take_ready(node: &mut TestNode) -> Ready<TestCmd, TestSnap> {
-    node.ready()
+    let ready = node.ready().expect("expected Ready generation");
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready
 }
 
 fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, TestSnap>> {
-    node.ready().messages
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready.messages
 }
 
 fn tick_to_timeout(node: &mut TestNode) {
@@ -118,9 +126,9 @@ fn elect_leader(nodes: &mut [TestNode; 3], leader_idx: usize) {
     deliver(nodes, prevotes);
 
     let mut prevote_responses = Vec::new();
-    for idx in 0..nodes.len() {
+    for (idx, node) in nodes.iter_mut().enumerate() {
         if idx != leader_idx {
-            prevote_responses.extend(take_messages(&mut nodes[idx]));
+            prevote_responses.extend(take_messages(node));
         }
     }
 
@@ -138,9 +146,9 @@ fn elect_leader(nodes: &mut [TestNode; 3], leader_idx: usize) {
     deliver(nodes, vote_requests);
 
     let mut vote_responses = Vec::new();
-    for idx in 0..nodes.len() {
+    for (idx, node) in nodes.iter_mut().enumerate() {
         if idx != leader_idx {
-            vote_responses.extend(take_messages(&mut nodes[idx]));
+            vote_responses.extend(take_messages(node));
         }
     }
 
@@ -158,26 +166,10 @@ fn mem_log_compaction_retains_boundary_term_and_visible_suffix() {
     let mut store = MemStorage::<TestCmd, TestSnap>::new();
 
     store.append(&[
-        LogEntry {
-            index: 1,
-            term: 1,
-            command: 10,
-        },
-        LogEntry {
-            index: 2,
-            term: 1,
-            command: 20,
-        },
-        LogEntry {
-            index: 3,
-            term: 2,
-            command: 30,
-        },
-        LogEntry {
-            index: 4,
-            term: 2,
-            command: 40,
-        },
+        LogEntry::normal(1, 1, 10),
+        LogEntry::normal(2, 1, 20),
+        LogEntry::normal(3, 2, 30),
+        LogEntry::normal(4, 2, 40),
     ]);
 
     store.compact(2);
@@ -192,10 +184,10 @@ fn mem_log_compaction_retains_boundary_term_and_visible_suffix() {
     assert_eq!(visible.len(), 2);
     assert_eq!(visible[0].index, 3);
     assert_eq!(visible[0].term, 2);
-    assert_eq!(visible[0].command, 30);
+    assert_eq!(visible[0].command(), Some(&30));
     assert_eq!(visible[1].index, 4);
     assert_eq!(visible[1].term, 2);
-    assert_eq!(visible[1].command, 40);
+    assert_eq!(visible[1].command(), Some(&40));
 }
 
 #[test]
@@ -203,11 +195,7 @@ fn file_snapshot_store_round_trips_latest_snapshot() {
     let dir = TestDir::new("file-snapshot-store");
     let path = dir.path().join("snapshot.txt");
 
-    let snapshot = Snapshot {
-        last_included_index: 5,
-        last_included_term: 2,
-        data: 77,
-    };
+    let snapshot = Snapshot::new(5, 2, test_conf_state(), 77);
 
     let mut store = FileSnapshotStore::open(path.clone(), U64Codec).unwrap();
     assert!(store.latest().is_none());
@@ -226,29 +214,31 @@ fn file_snapshot_store_round_trips_latest_snapshot() {
 }
 
 #[test]
-fn install_snapshot_stages_ready_snapshot_and_acks_leader() {
+fn install_snapshot_waits_for_verified_external_image_before_acknowledging() {
     let mut follower = new_node(2, vec![1, 3]);
 
-    let snapshot = Snapshot {
-        last_included_index: 5,
-        last_included_term: 2,
-        data: 99,
-    };
+    let snapshot = Snapshot::new(5, 2, test_conf_state(), 99);
 
     follower.step(Envelope {
         from: 1,
         to: 2,
-        msg: Message::InstallSnapshot(InstallSnapshotRequest {
-            term: 3,
-            leader_id: 1,
-            snapshot: snapshot.clone(),
-        }),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(3, 1, snapshot.metadata())),
     });
 
-    let ready = take_ready(&mut follower);
+    let metadata_ready = take_ready(&mut follower);
 
     assert_eq!(follower.role(), &Role::Follower);
     assert_eq!(follower.leader_id(), Some(1));
+    assert_eq!(follower.commit_index(), 0);
+    assert_eq!(metadata_ready.snapshot_install, Some(snapshot.metadata()));
+    assert!(metadata_ready.snapshot.is_none());
+    assert!(metadata_ready.messages.is_empty());
+
+    follower
+        .complete_snapshot_install(snapshot.clone())
+        .unwrap();
+    let ready = take_ready(&mut follower);
+
     assert_eq!(follower.commit_index(), 5);
     assert_eq!(follower.first_log_index(), 6);
     assert_eq!(follower.last_log_index(), 5);
@@ -276,22 +266,16 @@ fn install_snapshot_stages_ready_snapshot_and_acks_leader() {
 fn restoring_staged_snapshot_promotes_it_to_latest_snapshot() {
     let mut follower = new_node(2, vec![1, 3]);
 
-    let snapshot = Snapshot {
-        last_included_index: 4,
-        last_included_term: 2,
-        data: 123,
-    };
+    let snapshot = Snapshot::new(4, 2, test_conf_state(), 123);
 
     follower.step(Envelope {
         from: 1,
         to: 2,
-        msg: Message::InstallSnapshot(InstallSnapshotRequest {
-            term: 3,
-            leader_id: 1,
-            snapshot: snapshot.clone(),
-        }),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(3, 1, snapshot.metadata())),
     });
 
+    take_ready(&mut follower);
+    follower.complete_snapshot_install(snapshot).unwrap();
     let ready = take_ready(&mut follower);
     let staged_snapshot = ready.snapshot.expect("expected staged snapshot");
 
@@ -302,11 +286,7 @@ fn restoring_staged_snapshot_promotes_it_to_latest_snapshot() {
 
 #[test]
 fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
-    let snapshot = Snapshot {
-        last_included_index: 2,
-        last_included_term: 1,
-        data: 500,
-    };
+    let snapshot = Snapshot::new(2, 1, test_conf_state(), 500);
 
     let mut nodes = [
         new_node_with_log(1, vec![2, 3], &[(1, 1, 10), (2, 1, 20), (3, 2, 30)]),
@@ -361,13 +341,20 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
         Message::InstallSnapshot(req) => {
             assert_eq!(req.term, nodes[0].current_term());
             assert_eq!(req.leader_id, 1);
-            assert_eq!(req.snapshot, snapshot);
+            assert_eq!(req.metadata, snapshot.metadata());
         }
         _ => panic!("expected InstallSnapshot"),
     }
 
     nodes[1].step(snapshot_send.into_iter().next().unwrap());
 
+    let metadata_ready = take_ready(&mut nodes[1]);
+    assert_eq!(metadata_ready.snapshot_install, Some(snapshot.metadata()));
+    assert!(metadata_ready.messages.is_empty());
+
+    nodes[1]
+        .complete_snapshot_install(snapshot.clone())
+        .unwrap();
     let follower_ready = take_ready(&mut nodes[1]);
     assert_eq!(follower_ready.snapshot, Some(snapshot.clone()));
     assert_eq!(follower_ready.messages.len(), 1);
@@ -392,7 +379,7 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
             assert_eq!(req.entries.len(), 1);
             assert_eq!(req.entries[0].index, 3);
             assert_eq!(req.entries[0].term, 2);
-            assert_eq!(req.entries[0].command, 30);
+            assert_eq!(req.entries[0].command(), Some(&30));
         }
         _ => panic!("expected AppendEntries after snapshot install"),
     }

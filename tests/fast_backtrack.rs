@@ -30,11 +30,7 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 
     let seeded_entries: Vec<LogEntry<TestCmd>> = entries
         .iter()
-        .map(|(index, term, command)| LogEntry {
-            index: *index,
-            term: *term,
-            command: *command,
-        })
+        .map(|(index, term, command)| LogEntry::normal(*index, *term, *command))
         .collect();
 
     log.append(&seeded_entries);
@@ -58,7 +54,19 @@ fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
 }
 
 fn take_messages(node: &mut TestNode) -> Vec<Envelope<TestCmd, ()>> {
-    node.ready().messages
+    let Some(ready) = node.ready() else {
+        return Vec::new();
+    };
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready.messages
+}
+
+fn take_ready(node: &mut TestNode) -> raft::core::ready::Ready<TestCmd, ()> {
+    let ready = node.ready().expect("expected Ready generation");
+    node.persist_ready_to_embedded_storage(&ready).unwrap();
+    node.advance_persisted(ready.id).unwrap();
+    ready
 }
 
 fn flush_cluster(nodes: &mut [TestNode; 3], max_rounds: usize) {
@@ -107,7 +115,7 @@ fn follower_reports_conflict_term_and_first_index() {
         }),
     });
 
-    let ready = follower.ready();
+    let ready = take_ready(&mut follower);
     assert_eq!(ready.messages.len(), 1);
 
     match &ready.messages[0].msg {
@@ -160,7 +168,7 @@ fn leader_skips_to_end_of_conflict_term_on_rejection() {
             assert_eq!(req.entries.len(), 1);
             assert_eq!(req.entries[0].index, 5);
             assert_eq!(req.entries[0].term, 3);
-            assert_eq!(req.entries[0].command, 30);
+            assert_eq!(req.entries[0].command(), Some(&30));
         }
         _ => panic!("expected retry AppendEntries"),
     }

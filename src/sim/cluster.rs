@@ -5,9 +5,12 @@ use crate::{
         node::{ProposeError, RaftNode},
         ready::Ready,
     },
-    message::Envelope,
+    entry::EntryPayload,
+    message::{Envelope, Message},
     storage::mem::MemStorage,
-    traits::state_machine::SnapshotableStateMachine,
+    traits::{
+        log_store::LogStore, stable_store::StableStore, state_machine::SnapshotableStateMachine,
+    },
     types::{LogIndex, NodeId, Snapshot},
 };
 
@@ -15,6 +18,14 @@ use super::network::SimNetwork;
 
 pub type SimStorage<C, S> = MemStorage<C, S>;
 pub type SimRaftNode<C, S> = RaftNode<C, S, SimStorage<C, S>, SimStorage<C, S>>;
+
+/// Deterministic crash points inside the strict Ready persistence order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceFaultPoint {
+    BeforePersistence,
+    AfterSnapshotAndEntries,
+    AfterHardStateBeforeAcknowledgement,
+}
 
 pub struct SimNode<C, S, M>
 where
@@ -25,6 +36,7 @@ where
     pub raft: SimRaftNode<C, S>,
     pub state_machine: M,
     pub crashed: bool,
+    persistence_fault: Option<PersistenceFaultPoint>,
 
     persisted_log: SimStorage<C, S>,
     persisted_stable: SimStorage<C, S>,
@@ -37,6 +49,7 @@ where
     C: Clone,
     S: Clone,
     M: SnapshotableStateMachine<C, Snapshot = S> + Clone,
+    M::Error: std::fmt::Debug,
 {
     fn new(
         id: NodeId,
@@ -60,6 +73,7 @@ where
             raft,
             state_machine: state_machine.clone(),
             crashed: false,
+            persistence_fault: None,
             persisted_log: log,
             persisted_stable: stable,
             persisted_snapshot: None,
@@ -88,7 +102,7 @@ where
         }
 
         let restored_sm = self.persisted_state_machine.clone();
-        raft.advance(restored_sm.last_applied());
+        raft.advance_applied(restored_sm.last_applied()).unwrap();
 
         self.raft = raft;
         self.state_machine = restored_sm;
@@ -97,31 +111,67 @@ where
 
     fn handle_ready(&mut self, ready: Ready<C, S>) -> Vec<Envelope<C, S>> {
         let Ready {
+            id,
+            hard_state,
+            conf_state,
+            entries_to_persist,
             snapshot,
             messages,
             committed_entries,
             ..
         } = ready;
 
-        if let Some(snapshot) = snapshot {
-            self.state_machine.restore(snapshot.data.clone());
-            self.raft.restore_snapshot(snapshot.clone());
-            self.persisted_snapshot = Some(snapshot);
+        let fault = self.persistence_fault.take();
+        if fault == Some(PersistenceFaultPoint::BeforePersistence) {
+            self.crashed = true;
+            return Vec::new();
         }
+
+        // The simulator models the durable host boundary independently from
+        // the core's logical state so crash injection can be added at each
+        // persistence record in the next phase slice.
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.persisted_log
+                .install_snapshot(snapshot.last_included_index, snapshot.last_included_term);
+            self.persisted_snapshot = Some(snapshot.clone());
+        }
+        self.persisted_log.append(&entries_to_persist);
+        if fault == Some(PersistenceFaultPoint::AfterSnapshotAndEntries) {
+            self.crashed = true;
+            return Vec::new();
+        }
+        if let Some(conf_state) = conf_state {
+            self.persisted_stable.set_conf_state(conf_state);
+        }
+        if let Some(hard_state) = hard_state {
+            self.persisted_stable.set_hard_state(hard_state);
+        }
+        if fault == Some(PersistenceFaultPoint::AfterHardStateBeforeAcknowledgement) {
+            self.crashed = true;
+            return Vec::new();
+        }
+
+        self.raft.advance_persisted(id).unwrap();
 
         let mut applied_through = None;
 
+        if let Some(snapshot) = snapshot {
+            self.state_machine.restore(snapshot.data.clone()).unwrap();
+            self.raft.restore_snapshot(snapshot.clone());
+            applied_through = Some(self.state_machine.last_applied());
+        }
+
         for entry in committed_entries {
-            let _ = self.state_machine.apply(entry.index, &entry.command);
+            if let EntryPayload::Normal(command) = &entry.payload {
+                self.state_machine.apply(entry.index, command).unwrap();
+            }
             applied_through = Some(entry.index);
         }
 
         if let Some(index) = applied_through {
-            self.raft.advance(index);
+            self.raft.advance_applied(index).unwrap();
         }
 
-        self.persisted_log = self.raft.log.clone();
-        self.persisted_stable = self.raft.stable.clone();
         self.persisted_state_machine = self.state_machine.clone();
 
         if let Some(snapshot) = self.raft.latest_snapshot().cloned() {
@@ -154,6 +204,7 @@ where
     C: Clone,
     S: Clone,
     M: SnapshotableStateMachine<C, Snapshot = S> + Clone + Default,
+    M::Error: std::fmt::Debug,
 {
     pub fn new(node_ids: Vec<NodeId>, election_timeout: u64, heartbeat_interval: u64) -> Self {
         Self::with_state_machines(node_ids, election_timeout, heartbeat_interval, |_| {
@@ -167,6 +218,7 @@ where
     C: Clone,
     S: Clone,
     M: SnapshotableStateMachine<C, Snapshot = S> + Clone,
+    M::Error: std::fmt::Debug,
 {
     pub fn with_state_machines<F>(
         node_ids: Vec<NodeId>,
@@ -280,6 +332,12 @@ where
         self.network.set_delay_range(min_ticks, max_ticks);
     }
 
+    pub fn inject_persistence_fault(&mut self, id: NodeId, point: PersistenceFaultPoint) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.persistence_fault = Some(point);
+        }
+    }
+
     pub fn tick(&mut self, id: NodeId, ticks: u64) -> Vec<Envelope<C, S>> {
         let Some(node) = self.nodes.get_mut(&id) else {
             return Vec::new();
@@ -325,6 +383,15 @@ where
 
     pub fn deliver_message(&mut self, message: Envelope<C, S>) -> Vec<Envelope<C, S>> {
         let target = message.to;
+        let external_snapshot = match &message.msg {
+            Message::InstallSnapshot(request) => self
+                .nodes
+                .get(&message.from)
+                .and_then(|node| node.raft.latest_snapshot())
+                .filter(|snapshot| snapshot.metadata() == request.metadata)
+                .cloned(),
+            _ => None,
+        };
 
         let delivered = {
             let Some(node) = self.nodes.get_mut(&target) else {
@@ -340,7 +407,16 @@ where
         };
 
         if delivered {
-            self.collect_ready(target)
+            let mut messages = self.collect_ready(target);
+            if let Some(snapshot) = external_snapshot
+                && let Some(node) = self.nodes.get_mut(&target)
+            {
+                node.raft
+                    .complete_snapshot_install(snapshot)
+                    .expect("simulator snapshot metadata must match the source image");
+                messages.extend(self.collect_ready(target));
+            }
+            messages
         } else {
             Vec::new()
         }
@@ -385,8 +461,14 @@ where
             return Vec::new();
         }
 
-        let ready = node.raft.ready();
-        node.handle_ready(ready)
+        let Some(ready) = node.raft.ready() else {
+            return Vec::new();
+        };
+        let messages = node.handle_ready(ready);
+        if node.crashed {
+            self.network.mark_down(id);
+        }
+        messages
     }
 }
 

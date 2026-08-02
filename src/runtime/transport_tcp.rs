@@ -275,8 +275,8 @@ where
     pub fn decode_envelope(&self, bytes: &[u8]) -> io::Result<Envelope<C, S>> {
         let mut cursor = Cursor::new(bytes);
 
-        let from = read_u64(&mut cursor)?;
-        let to = read_u64(&mut cursor)?;
+        let from = read_replica_id(&mut cursor)?;
+        let to = read_replica_id(&mut cursor)?;
         let tag = read_u8(&mut cursor)?;
 
         let msg = match tag {
@@ -323,7 +323,7 @@ where
     fn decode_prevote_request(&self, cursor: &mut Cursor<&[u8]>) -> io::Result<PreVoteRequest> {
         Ok(PreVoteRequest {
             term: read_u64(cursor)?,
-            candidate_id: read_u64(cursor)?,
+            candidate_id: read_replica_id(cursor)?,
             last_log_index: read_u64(cursor)?,
             last_log_term: read_u64(cursor)?,
         })
@@ -354,7 +354,7 @@ where
     ) -> io::Result<RequestVoteRequest> {
         Ok(RequestVoteRequest {
             term: read_u64(cursor)?,
-            candidate_id: read_u64(cursor)?,
+            candidate_id: read_replica_id(cursor)?,
             last_log_index: read_u64(cursor)?,
             last_log_term: read_u64(cursor)?,
         })
@@ -410,7 +410,7 @@ where
         cursor: &mut Cursor<&[u8]>,
     ) -> io::Result<AppendEntriesRequest<C>> {
         let term = read_u64(cursor)?;
-        let leader_id = read_u64(cursor)?;
+        let leader_id = read_replica_id(cursor)?;
         let prev_log_index = read_u64(cursor)?;
         let prev_log_term = read_u64(cursor)?;
         let leader_commit = read_u64(cursor)?;
@@ -506,7 +506,7 @@ where
         cursor: &mut Cursor<&[u8]>,
     ) -> io::Result<InstallSnapshotRequest<S>> {
         let term = read_u64(cursor)?;
-        let leader_id = read_u64(cursor)?;
+        let leader_id = read_replica_id(cursor)?;
         let snapshot_id = read_u64(cursor)?;
         let last_included_index = read_u64(cursor)?;
         let last_included_term = read_u64(cursor)?;
@@ -652,8 +652,8 @@ fn push_bool(buf: &mut Vec<u8>, value: bool) {
     push_u8(buf, if value { 1 } else { 0 });
 }
 
-fn push_u64(buf: &mut Vec<u8>, value: u64) {
-    buf.extend_from_slice(&value.to_be_bytes());
+fn push_u64(buf: &mut Vec<u8>, value: impl Into<u64>) {
+    buf.extend_from_slice(&value.into().to_be_bytes());
 }
 
 fn push_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -752,7 +752,13 @@ fn decode_replica_set(cursor: &mut Cursor<&[u8]>) -> io::Result<BTreeSet<NodeId>
     let count = read_u64(cursor)?;
     let mut values = BTreeSet::new();
     for _ in 0..count {
-        values.insert(read_u64(cursor)?);
+        let replica_id = read_replica_id(cursor)?;
+        if !values.insert(replica_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate replica ID {replica_id}"),
+            ));
+        }
     }
     Ok(values)
 }
@@ -776,7 +782,7 @@ fn decode_conf_state(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfState> {
 fn decode_conf_change(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfChange> {
     let expected_version = read_u64(cursor)?;
     let tag = read_u8(cursor)?;
-    let replica_id = read_u64(cursor)?;
+    let replica_id = read_replica_id(cursor)?;
     let kind = match tag {
         0 => ConfChangeKind::AddLearner(replica_id),
         1 => ConfChangeKind::PromoteLearner(replica_id),
@@ -791,5 +797,16 @@ fn decode_conf_change(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfChange> {
     Ok(ConfChange {
         expected_version,
         kind,
+    })
+}
+
+fn read_replica_id(cursor: &mut Cursor<&[u8]>) -> io::Result<NodeId> {
+    let value = read_u64(cursor)?;
+
+    NodeId::new(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "wire message contains reserved replica ID zero",
+        )
     })
 }

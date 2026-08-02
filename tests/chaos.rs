@@ -5,10 +5,16 @@ use raft::{
         scheduler::{SimAction, SimScheduler, SimStepOutcome},
     },
     sm::mem_kv::{MemKv, MemKvCommand, MemKvSnapshot},
-    types::Role,
+    types::{ReplicaId, Role},
 };
 
-const NODE_IDS: [u64; 5] = [1, 2, 3, 4, 5];
+const NODE_IDS: [ReplicaId; 5] = [
+    ReplicaId::must(1),
+    ReplicaId::must(2),
+    ReplicaId::must(3),
+    ReplicaId::must(4),
+    ReplicaId::must(5),
+];
 const ELECTION_TIMEOUT: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 2;
 const MAX_DELIVERY_STEPS: usize = 1024;
@@ -24,12 +30,12 @@ fn new_scheduler() -> TestScheduler {
     ))
 }
 
-fn wait_for_leader(sim: &mut TestScheduler) -> u64 {
+fn wait_for_leader(sim: &mut TestScheduler) -> ReplicaId {
     sim.wait_for_leader(12, ELECTION_TIMEOUT, MAX_DELIVERY_STEPS)
         .expect("cluster should elect a leader")
 }
 
-fn wait_for_group_leader(sim: &mut TestScheduler, group: &[u64]) -> u64 {
+fn wait_for_group_leader(sim: &mut TestScheduler, group: &[ReplicaId]) -> ReplicaId {
     for _ in 0..12 {
         advance_rounds(sim, 1, ELECTION_TIMEOUT);
 
@@ -61,7 +67,7 @@ fn advance_rounds(sim: &mut TestScheduler, rounds: usize, ticks: u64) {
 
 fn propose_put(
     sim: &mut TestScheduler,
-    node_id: u64,
+    node_id: ReplicaId,
     key: &str,
     value: &str,
 ) -> Result<u64, ProposeError> {
@@ -77,7 +83,7 @@ fn propose_put(
     }
 }
 
-fn assert_value(sim: &TestScheduler, node_id: u64, key: &str, expected: Option<&str>) {
+fn assert_value(sim: &TestScheduler, node_id: ReplicaId, key: &str, expected: Option<&str>) {
     let sm = sim
         .cluster()
         .state_machine(node_id)
@@ -86,13 +92,18 @@ fn assert_value(sim: &TestScheduler, node_id: u64, key: &str, expected: Option<&
     assert_eq!(sm.get(key).map(|value| value.as_str()), expected);
 }
 
-fn assert_value_on_nodes(sim: &TestScheduler, node_ids: &[u64], key: &str, expected: Option<&str>) {
+fn assert_value_on_nodes(
+    sim: &TestScheduler,
+    node_ids: &[ReplicaId],
+    key: &str,
+    expected: Option<&str>,
+) {
     for &node_id in node_ids {
         assert_value(sim, node_id, key, expected);
     }
 }
 
-fn split_with_leader_in_majority(leader: u64) -> Vec<Vec<u64>> {
+fn split_with_leader_in_majority(leader: ReplicaId) -> Vec<Vec<ReplicaId>> {
     let others = NODE_IDS
         .into_iter()
         .filter(|node_id| *node_id != leader)
@@ -104,7 +115,7 @@ fn split_with_leader_in_majority(leader: u64) -> Vec<Vec<u64>> {
     ]
 }
 
-fn split_with_leader_in_minority(leader: u64) -> Vec<Vec<u64>> {
+fn split_with_leader_in_minority(leader: ReplicaId) -> Vec<Vec<ReplicaId>> {
     let others = NODE_IDS
         .into_iter()
         .filter(|node_id| *node_id != leader)

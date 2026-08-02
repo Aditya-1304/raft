@@ -48,7 +48,7 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 
 fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
     for msg in messages {
-        let idx = (msg.to - 1) as usize;
+        let idx = (msg.to.get() - 1) as usize;
         nodes[idx].step(msg);
     }
 }
@@ -103,11 +103,11 @@ fn follower_reports_conflict_term_and_first_index() {
     );
 
     follower.step(Envelope {
-        from: 1,
-        to: 2,
+        from: raft::types::ReplicaId::must(1),
+        to: raft::types::ReplicaId::must(2),
         msg: Message::AppendEntries(AppendEntriesRequest {
             term: 3,
-            leader_id: 1,
+            leader_id: raft::types::ReplicaId::must(1),
             prev_log_index: 4,
             prev_log_term: 3,
             entries: Vec::new(),
@@ -146,8 +146,8 @@ fn leader_skips_to_end_of_conflict_term_on_rejection() {
     let current_term = nodes[0].current_term();
 
     nodes[0].step(Envelope {
-        from: 2,
-        to: 1,
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
         msg: Message::AppendEntriesResponse(AppendEntriesResponse {
             term: current_term,
             success: false,
@@ -162,7 +162,7 @@ fn leader_skips_to_end_of_conflict_term_on_rejection() {
 
     match &retries[0].msg {
         Message::AppendEntries(req) => {
-            assert_eq!(retries[0].to, 2);
+            assert_eq!(retries[0].to.get(), 2);
             assert_eq!(req.prev_log_index, 4);
             assert_eq!(req.prev_log_term, 2);
             assert_eq!(req.entries.len(), 1);

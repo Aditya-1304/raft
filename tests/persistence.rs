@@ -90,7 +90,7 @@ fn reopen_log(files: &NodeFiles) -> TestLogStore {
 
 fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
     for msg in messages {
-        let idx = (msg.to - 1) as usize;
+        let idx = (msg.to.get() - 1) as usize;
         nodes[idx].step(msg);
     }
 }
@@ -154,7 +154,7 @@ fn crash_after_commit_recovers_persisted_state() {
     let to_n2: Vec<_> = leader_ready
         .messages
         .into_iter()
-        .filter(|msg| msg.to == 2)
+        .filter(|msg| msg.to.get() == 2)
         .collect();
     deliver(&mut nodes, to_n2);
 
@@ -176,9 +176,9 @@ fn crash_after_commit_recovers_persisted_state() {
 
     let restarted = open_node(1, vec![2, 3], &files[0]);
     assert_eq!(restarted.role(), &Role::Follower);
-    assert_eq!(restarted.leader_id(), None);
+    assert_eq!(restarted.leader_id().map(|id| id.get()), None);
     assert_eq!(restarted.current_term(), term_before_crash);
-    assert_eq!(restarted.hard_state().voted_for, Some(1));
+    assert_eq!(restarted.hard_state().voted_for.map(|id| id.get()), Some(1));
     assert_eq!(restarted.commit_index(), 1);
     assert_eq!(restarted.hard_state().commit, 1);
     assert_eq!(restarted.last_log_index(), 1);
@@ -209,7 +209,7 @@ fn crash_before_commit_preserves_uncommitted_log() {
 
     let restarted = open_node(1, vec![2, 3], &files[0]);
     assert_eq!(restarted.role(), &Role::Follower);
-    assert_eq!(restarted.leader_id(), None);
+    assert_eq!(restarted.leader_id().map(|id| id.get()), None);
     assert_eq!(restarted.current_term(), term_before_crash);
     assert_eq!(restarted.commit_index(), 0);
     assert_eq!(restarted.hard_state().commit, 0);
@@ -234,7 +234,7 @@ fn full_restart_and_lagging_follower_catches_up() {
     let to_n2: Vec<_> = leader_ready
         .messages
         .into_iter()
-        .filter(|msg| msg.to == 2)
+        .filter(|msg| msg.to.get() == 2)
         .collect();
     deliver(&mut nodes, to_n2);
 

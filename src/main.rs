@@ -535,8 +535,13 @@ fn open_runtime_server(options: &NodeOptions) -> io::Result<DemoServer> {
         DemoSnapshotStore::open(options.data_dir.join("snapshot.txt"), CounterSnapshotCodec)?;
 
     let raft = RaftNode::new(
-        member.node_id,
-        options.cluster.peer_ids(member.node_id),
+        member.node_id.get(),
+        options
+            .cluster
+            .peer_ids(member.node_id)
+            .into_iter()
+            .map(NodeId::get)
+            .collect(),
         log_store,
         stable_store,
         options.election_timeout_ticks,
@@ -856,13 +861,13 @@ fn send_propose_request(
     let fields = send_simple_admin_command(admin_addr, &format!("propose {command}"))?;
     match require_kind(&fields, "accepted or not_leader")? {
         "accepted" => Ok(ProposeOutcome::Accepted {
-            node_id: parse_required_u64_field(&fields, "node_id")?,
-            leader_id: parse_optional_u64_field(&fields, "leader_id")?,
+            node_id: parse_required_replica_id_field(&fields, "node_id")?,
+            leader_id: parse_optional_replica_id_field(&fields, "leader_id")?,
             log_index: parse_required_u64_field(&fields, "log_index")?,
         }),
         "not_leader" => Ok(ProposeOutcome::NotLeader {
-            node_id: parse_required_u64_field(&fields, "node_id")?,
-            leader_id: parse_optional_u64_field(&fields, "leader_id")?,
+            node_id: parse_required_replica_id_field(&fields, "node_id")?,
+            leader_id: parse_optional_replica_id_field(&fields, "leader_id")?,
         }),
         "error" => Err(io::Error::other(
             fields
@@ -1060,13 +1065,13 @@ fn parse_status_response(fields: &BTreeMap<String, String>) -> io::Result<NodeSt
     }
 
     Ok(NodeStatus {
-        node_id: parse_required_u64_field(fields, "node_id")?,
+        node_id: parse_required_replica_id_field(fields, "node_id")?,
         raft_addr: parse_required_socketaddr_field(fields, "raft_addr")?,
         admin_addr: parse_required_socketaddr_field(fields, "admin_addr")?,
         role: parse_role_field(fields, "role")?,
-        leader_id: parse_optional_u64_field(fields, "leader_id")?,
+        leader_id: parse_optional_replica_id_field(fields, "leader_id")?,
         current_term: parse_required_u64_field(fields, "current_term")?,
-        voted_for: parse_optional_u64_field(fields, "voted_for")?,
+        voted_for: parse_optional_replica_id_field(fields, "voted_for")?,
         commit_index: parse_required_u64_field(fields, "commit_index")?,
         last_applied: parse_required_u64_field(fields, "last_applied")?,
         first_log_index: parse_required_u64_field(fields, "first_log_index")?,
@@ -1147,7 +1152,10 @@ fn parse_node_args(args: &[String]) -> io::Result<NodeOptions> {
         match args[i].as_str() {
             "--id" => {
                 i += 1;
-                id = Some(parse_u64_text(require_arg(args, i, "--id")?, "--id")?);
+                id = Some(parse_replica_id_text(
+                    require_arg(args, i, "--id")?,
+                    "--id",
+                )?);
             }
             "--data-dir" => {
                 i += 1;
@@ -1280,7 +1288,7 @@ fn parse_propose_args(args: &[String]) -> io::Result<ProposeOptions> {
             }
             "--target-node" => {
                 i += 1;
-                target_node = Some(parse_u64_text(
+                target_node = Some(parse_replica_id_text(
                     require_arg(args, i, "--target-node")?,
                     "--target-node",
                 )?);
@@ -1330,7 +1338,7 @@ fn parse_node_action_args(args: &[String]) -> io::Result<NodeActionOptions> {
             }
             "--node-id" => {
                 i += 1;
-                node_id = Some(parse_u64_text(
+                node_id = Some(parse_replica_id_text(
                     require_arg(args, i, "--node-id")?,
                     "--node-id",
                 )?);
@@ -1396,7 +1404,7 @@ fn parse_cluster_member(text: &str) -> io::Result<ClusterMember> {
     })?;
 
     Ok(ClusterMember {
-        node_id: parse_u64_text(node_text, "cluster node id")?,
+        node_id: parse_replica_id_text(node_text, "cluster node id")?,
         raft_addr: parse_socketaddr_text(raft_text, "cluster raft addr")?,
         admin_addr: parse_socketaddr_text(admin_text, "cluster admin addr")?,
     })
@@ -1492,6 +1500,15 @@ fn parse_u64_text(text: &str, what: &str) -> io::Result<u64> {
     })
 }
 
+fn parse_replica_id_text(text: &str, what: &str) -> io::Result<NodeId> {
+    text.parse().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {what} `{text}`: {err}"),
+        )
+    })
+}
+
 fn parse_usize_text(text: &str, what: &str) -> io::Result<usize> {
     text.parse().map_err(|err| {
         io::Error::new(
@@ -1530,20 +1547,27 @@ fn parse_role_field(fields: &BTreeMap<String, String>, key: &str) -> io::Result<
     }
 }
 
-fn option_u64_to_wire(value: Option<u64>) -> String {
+fn option_u64_to_wire<T: ToString>(value: Option<T>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string())
 }
 
-fn parse_optional_u64_field(
+fn parse_optional_replica_id_field(
     fields: &BTreeMap<String, String>,
     key: &str,
-) -> io::Result<Option<u64>> {
+) -> io::Result<Option<NodeId>> {
     match parse_required_string_field(fields, key)?.as_str() {
         "none" => Ok(None),
-        text => Ok(Some(parse_u64_text(text, key)?)),
+        text => Ok(Some(parse_replica_id_text(text, key)?)),
     }
+}
+
+fn parse_required_replica_id_field(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> io::Result<NodeId> {
+    parse_replica_id_text(&parse_required_string_field(fields, key)?, key)
 }
 
 fn parse_required_u64_field(fields: &BTreeMap<String, String>, key: &str) -> io::Result<u64> {

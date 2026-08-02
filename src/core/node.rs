@@ -174,13 +174,15 @@ where
     SS: StableStore,
 {
     pub fn new(
-        id: NodeId,
-        peers: Vec<NodeId>,
+        id: u64,
+        peers: Vec<u64>,
         log: LS,
         stable: SS,
         election_timeout: u64,
         heartbeat_interval: u64,
     ) -> Self {
+        let id = NodeId::must(id);
+        let peers: Vec<NodeId> = peers.into_iter().map(NodeId::must).collect();
         let stored_conf_state = stable.conf_state();
         let conf_state = stored_conf_state.clone().unwrap_or_else(|| {
             ConfState::new(1, std::iter::once(id).chain(peers.iter().copied()), [])
@@ -911,7 +913,7 @@ where
         heartbeat_interval: u64,
     ) -> u64 {
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        seed ^= id.rotate_left(7);
+        seed ^= id.get().rotate_left(7);
         seed ^= (peers.len() as u64).rotate_left(17);
         seed ^= election_timeout.rotate_left(31);
         seed ^= heartbeat_interval.rotate_left(47);

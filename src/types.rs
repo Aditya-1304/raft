@@ -1,14 +1,130 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+    num::ParseIntError,
+    str::FromStr,
+};
 
-/// Identifies one lifetime of one replica inside a Raft group.
+/// Identifies one lifetime of one replica inside one Raft group.
 ///
-/// Physical-node routing belongs to the host. The Raft core only exchanges
-/// replica identities, allowing a host to move or replace replicas without
-/// confusing consensus identity with a machine identity.
-pub type ReplicaId = u64;
-/// Compatibility name retained for the standalone runtime and simulator.
-/// New host integrations should use `ReplicaId` at the Raft boundary.
+/// Replica IDs are consensus identities, not physical server identities. A
+/// removed value must never be reused for another replica lifetime.
+///
+/// ```compile_fail
+/// use raft::types::ReplicaId;
+///
+/// fn accepts_replica_id(_: ReplicaId) {}
+///
+/// // A raw integer cannot cross the Raft boundary accidentally.
+/// accepts_replica_id(7_u64);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ReplicaId(u64);
+
+impl ReplicaId {
+    /// Constructs a replica identity.
+    ///
+    /// Zero is reserved as the absent/invalid value in durable and wire
+    /// encodings and therefore cannot become a valid consensus identity.
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    /// Returns the stable scalar representation used by durable host codecs.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Constructs a replica ID for static declarations and trusted fixtures.
+    ///
+    /// This function panics for zero, preserving the same invariant as `new`
+    /// while remaining usable in constants.
+    pub const fn must(value: u64) -> Self {
+        match Self::new(value) {
+            Some(replica_id) => replica_id,
+            None => panic!("replica ID must be non-zero"),
+        }
+    }
+}
+
+impl From<ReplicaId> for u64 {
+    fn from(value: ReplicaId) -> Self {
+        value.get()
+    }
+}
+
+impl TryFrom<u64> for ReplicaId {
+    type Error = ReplicaIdError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or(ReplicaIdError::Zero)
+    }
+}
+
+impl FromStr for ReplicaId {
+    type Err = ReplicaIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value
+            .parse::<u64>()
+            .map_err(ReplicaIdParseError::InvalidInteger)?;
+
+        Self::new(value).ok_or(ReplicaIdParseError::Zero)
+    }
+}
+
+impl fmt::Display for ReplicaId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdError {
+    Zero,
+}
+
+impl fmt::Display for ReplicaIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("replica ID must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicaIdError {}
+
+#[derive(Debug)]
+pub enum ReplicaIdParseError {
+    InvalidInteger(ParseIntError),
+    Zero,
+}
+
+impl fmt::Display for ReplicaIdParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInteger(error) => write!(formatter, "invalid replica ID: {error}"),
+            Self::Zero => formatter.write_str("replica ID must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicaIdParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInteger(error) => Some(error),
+            Self::Zero => None,
+        }
+    }
+}
+
+/// Compatibility name for standalone Raft code written before replica and
+/// physical-node identities were separated by the host.
+///
+/// This alias remains strongly typed because its target is `ReplicaId`.
 pub type NodeId = ReplicaId;
+
 pub type Term = u64;
 pub type LogIndex = u64;
 
@@ -108,18 +224,11 @@ impl ConfState {
         if self.version == 0 {
             return Err(ConfStateError::ZeroVersion);
         }
+
         if self.voters.is_empty() {
             return Err(ConfStateError::NoVoters);
         }
-        if self
-            .voters
-            .iter()
-            .chain(self.learners.iter())
-            .chain(self.outgoing_voters.iter())
-            .any(|id| *id == 0)
-        {
-            return Err(ConfStateError::ZeroReplicaId);
-        }
+
         if let Some(replica_id) = self
             .learners
             .iter()
@@ -127,6 +236,7 @@ impl ConfState {
         {
             return Err(ConfStateError::VoterLearnerOverlap(*replica_id));
         }
+
         Ok(())
     }
 
@@ -172,10 +282,10 @@ impl ConfState {
 
         match change.kind {
             ConfChangeKind::AddLearner(replica_id) => {
-                validate_replica_id(replica_id)?;
                 if next.contains(replica_id) {
                     return Err(ConfChangeError::ReplicaAlreadyExists(replica_id));
                 }
+
                 next.learners.insert(replica_id);
             }
             ConfChangeKind::PromoteLearner(replica_id) => {
@@ -207,19 +317,10 @@ fn has_majority(voters: &BTreeSet<ReplicaId>, granted: &HashSet<ReplicaId>) -> b
     votes > voters.len() / 2
 }
 
-fn validate_replica_id(replica_id: ReplicaId) -> Result<(), ConfChangeError> {
-    if replica_id == 0 {
-        Err(ConfChangeError::InvalidState(ConfStateError::ZeroReplicaId))
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfStateError {
     ZeroVersion,
     NoVoters,
-    ZeroReplicaId,
     VoterLearnerOverlap(ReplicaId),
 }
 

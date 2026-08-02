@@ -704,7 +704,12 @@ fn parse_optional_node_id(value: &str) -> io::Result<Option<NodeId>> {
     if value == "none" {
         Ok(None)
     } else {
-        parse_u64("voted_for", value).map(Some)
+        value.parse::<NodeId>().map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid voted_for value `{value}`: {error}"),
+            )
+        })
     }
 }
 
@@ -713,16 +718,28 @@ fn parse_replica_set(field: &str, value: &str) -> io::Result<BTreeSet<NodeId>> {
         return Ok(BTreeSet::new());
     }
 
-    value
-        .split(',')
-        .map(|part| parse_u64(field, part))
-        .collect()
+    let mut replicas = BTreeSet::new();
+    for encoded in value.split(',') {
+        let replica_id = encoded.parse::<NodeId>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {field} value `{encoded}`: {error}"),
+            )
+        })?;
+        if !replicas.insert(replica_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate {field} replica ID {replica_id}"),
+            ));
+        }
+    }
+    Ok(replicas)
 }
 
 fn encode_replica_set(values: &BTreeSet<NodeId>) -> String {
     values
         .iter()
-        .map(u64::to_string)
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -756,15 +773,18 @@ fn decode_conf_change(value: &str) -> io::Result<ConfChange> {
     let kind = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing configuration kind"))?;
-    let replica_id = parse_u64(
-        "configuration.replica_id",
-        parts.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing configuration replica ID",
-            )
-        })?,
-    )?;
+    let encoded_replica_id = parts.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing configuration replica ID",
+        )
+    })?;
+    let replica_id = encoded_replica_id.parse::<NodeId>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid configuration.replica_id value `{encoded_replica_id}`: {error}"),
+        )
+    })?;
     if parts.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -48,7 +48,7 @@ fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) 
 
 fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, ()>>) {
     for msg in messages {
-        let idx = (msg.to - 1) as usize;
+        let idx = (msg.to.get() - 1) as usize;
         nodes[idx].step(msg);
     }
 }
@@ -139,7 +139,7 @@ fn majority_commits() {
     let to_n2: Vec<_> = leader_ready
         .messages
         .into_iter()
-        .filter(|msg| msg.to == 2)
+        .filter(|msg| msg.to.get() == 2)
         .collect();
     deliver(&mut nodes, to_n2);
 
@@ -192,7 +192,7 @@ fn old_term_entry_commits_only_after_current_term_entry() {
     let to_n2: Vec<_> = leader_ready
         .messages
         .into_iter()
-        .filter(|msg| msg.to == 2)
+        .filter(|msg| msg.to.get() == 2)
         .collect();
     deliver(&mut nodes, to_n2);
 

@@ -4,7 +4,7 @@ use raft::{
     message::{Envelope, Message, PreVoteResponse, RequestVoteRequest},
     storage::mem::MemStorage,
     traits::stable_store::StableStore,
-    types::{ConfChange, ConfChangeKind, ConfState, Role},
+    types::{ConfChange, ConfChangeKind, ConfState, ReplicaId, Role},
 };
 
 type TestStorage = MemStorage<(), ()>;
@@ -33,15 +33,15 @@ fn non_member_prevote_response_cannot_advance_an_election() {
     // response would let one forged packet combine with the candidate's own
     // vote and manufacture a quorum in this three-voter group.
     let result = candidate.step_checked(Envelope {
-        from: 99,
-        to: 1,
+        from: raft::types::ReplicaId::must(99),
+        to: raft::types::ReplicaId::must(1),
         msg: Message::PreVoteResponse(PreVoteResponse {
             term: 0,
             vote_granted: true,
         }),
     });
 
-    assert_eq!(result, Err(StepError::UnknownReplica(99)));
+    assert_eq!(result, Err(StepError::UnknownReplica(ReplicaId::must(99))));
     assert_eq!(candidate.current_term(), 0);
     assert_eq!(candidate.role(), &Role::Candidate);
 }
@@ -54,11 +54,11 @@ fn vote_request_rejects_an_envelope_payload_identity_mismatch() {
     // payload claims that replica 99 is the candidate. Accepting this request
     // would persist a vote for an identity that never sent the message.
     let result = follower.step_checked(Envelope {
-        from: 2,
-        to: 1,
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
         msg: Message::RequestVote(RequestVoteRequest {
             term: 1,
-            candidate_id: 99,
+            candidate_id: raft::types::ReplicaId::must(99),
             last_log_index: 0,
             last_log_term: 0,
         }),
@@ -67,18 +67,30 @@ fn vote_request_rejects_an_envelope_payload_identity_mismatch() {
     assert_eq!(
         result,
         Err(StepError::PayloadIdentityMismatch {
-            envelope: 2,
-            payload: 99,
+            envelope: raft::types::ReplicaId::must(2),
+            payload: raft::types::ReplicaId::must(99),
         })
     );
-    assert_eq!(follower.hard_state().voted_for, None);
+    assert_eq!(follower.hard_state().voted_for.map(|id| id.get()), None);
 }
 
 #[test]
 fn learner_never_starts_an_election() {
-    let conf_state = ConfState::new(1, [1, 3], [2]).unwrap();
-    let mut learner: TestNode =
-        RaftNode::bootstrap(2, conf_state, MemStorage::new(), MemStorage::new(), 5, 2).unwrap();
+    let conf_state = ConfState::new(
+        1,
+        [ReplicaId::must(1), ReplicaId::must(3)],
+        [ReplicaId::must(2)],
+    )
+    .unwrap();
+    let mut learner: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(2),
+        conf_state,
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
 
     learner.tick(100);
 
@@ -89,7 +101,7 @@ fn learner_never_starts_an_election() {
 #[test]
 fn restart_requires_a_durable_configuration() {
     let result = RaftNode::<(), (), TestStorage, TestStorage>::restart(
-        1,
+        ReplicaId::must(1),
         MemStorage::new(),
         MemStorage::new(),
         5,
@@ -104,7 +116,12 @@ fn restart_requires_a_durable_configuration() {
 
 #[test]
 fn legacy_restart_does_not_replace_durable_membership_with_changed_peers() {
-    let durable = ConfState::new(7, [1, 2, 3], []).unwrap();
+    let durable = ConfState::new(
+        7,
+        [ReplicaId::must(1), ReplicaId::must(2), ReplicaId::must(3)],
+        [],
+    )
+    .unwrap();
     let mut stable = MemStorage::<(), ()>::new();
     stable.set_conf_state(durable.clone());
 
@@ -113,14 +130,21 @@ fn legacy_restart_does_not_replace_durable_membership_with_changed_peers() {
     let node: TestNode = RaftNode::new(1, vec![8, 9], MemStorage::new(), stable, 5, 2);
 
     assert_eq!(node.conf_state(), &durable);
-    assert!(!node.conf_state().contains(8));
+    assert!(!node.conf_state().contains(ReplicaId::must(8)));
 }
 
 #[test]
 fn committed_configuration_entry_emits_and_persists_conf_state() {
-    let initial = ConfState::new(1, [1], []).unwrap();
-    let mut node: TestNode =
-        RaftNode::bootstrap(1, initial, MemStorage::new(), MemStorage::new(), 5, 2).unwrap();
+    let initial = ConfState::new(1, [ReplicaId::must(1)], []).unwrap();
+    let mut node: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        initial,
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
 
     persist_one_ready(&mut node);
     node.tick(node.current_election_timeout());
@@ -130,7 +154,7 @@ fn committed_configuration_entry_emits_and_persists_conf_state() {
     let index = node
         .propose_conf_change(ConfChange {
             expected_version: 1,
-            kind: ConfChangeKind::AddLearner(2),
+            kind: ConfChangeKind::AddLearner(raft::types::ReplicaId::must(2)),
         })
         .unwrap();
     let ready = persist_one_ready(&mut node);
@@ -144,6 +168,6 @@ fn committed_configuration_entry_emits_and_persists_conf_state() {
         .conf_state
         .expect("committed ConfState must be emitted");
     assert_eq!(emitted.version, 2);
-    assert!(emitted.learners.contains(&2));
+    assert!(emitted.learners.contains(&ReplicaId::must(2)));
     assert_eq!(node.durable_conf_state(), Some(&emitted));
 }

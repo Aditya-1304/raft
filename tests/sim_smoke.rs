@@ -6,9 +6,10 @@ use raft::{
         scheduler::{SimAction, SimScheduler, SimStepOutcome},
     },
     sm::mem_kv::{MemKv, MemKvCommand, MemKvSnapshot},
+    types::ReplicaId,
 };
 
-const NODE_IDS: [u64; 3] = [1, 2, 3];
+const NODE_IDS: [ReplicaId; 3] = [ReplicaId::must(1), ReplicaId::must(2), ReplicaId::must(3)];
 const ELECTION_TIMEOUT: u64 = 5;
 const HEARTBEAT_INTERVAL: u64 = 2;
 const MAX_DELIVERY_STEPS: usize = 1024;
@@ -23,7 +24,7 @@ fn new_scheduler(seed: u64) -> TestScheduler {
     )
 }
 
-fn wait_for_leader(sim: &mut TestScheduler) -> u64 {
+fn wait_for_leader(sim: &mut TestScheduler) -> ReplicaId {
     sim.wait_for_leader(12, ELECTION_TIMEOUT, MAX_DELIVERY_STEPS)
         .expect("cluster should elect a leader")
 }
@@ -36,7 +37,7 @@ fn advance_rounds(sim: &mut TestScheduler, rounds: usize, ticks: u64) {
 
 fn propose_put(
     sim: &mut TestScheduler,
-    node_id: u64,
+    node_id: ReplicaId,
     key: &str,
     value: &str,
 ) -> Result<u64, ProposeError> {
@@ -52,7 +53,7 @@ fn propose_put(
     }
 }
 
-fn node_value(sim: &TestScheduler, node_id: u64, key: &str) -> Option<String> {
+fn node_value(sim: &TestScheduler, node_id: ReplicaId, key: &str) -> Option<String> {
     sim.cluster()
         .state_machine(node_id)
         .expect("state machine should exist")
@@ -73,7 +74,7 @@ fn assert_value_on_all_nodes(sim: &TestScheduler, key: &str, expected: Option<&s
     }
 }
 
-fn run_seeded_script(seed: u64) -> (u64, String, String, Vec<Option<String>>) {
+fn run_seeded_script(seed: u64) -> (ReplicaId, String, String, Vec<Option<String>>) {
     let mut sim = new_scheduler(seed);
     let leader = wait_for_leader(&mut sim);
 

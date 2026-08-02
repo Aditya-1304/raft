@@ -61,8 +61,8 @@ where
         let log = MemStorage::new();
         let stable = MemStorage::new();
         let raft = RaftNode::new(
-            id,
-            peers,
+            id.get(),
+            peers.into_iter().map(NodeId::get).collect(),
             log.clone(),
             stable.clone(),
             election_timeout,
@@ -89,8 +89,8 @@ where
         heartbeat_interval: u64,
     ) {
         let mut raft = RaftNode::new(
-            id,
-            peers,
+            id.get(),
+            peers.into_iter().map(NodeId::get).collect(),
             self.persisted_log.clone(),
             self.persisted_stable.clone(),
             election_timeout,

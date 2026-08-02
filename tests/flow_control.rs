@@ -96,7 +96,7 @@ fn catch_up_batches_respect_entry_limits_and_progress_modes() {
 
     let heartbeat = elect_with_one_follower(&mut leader, &mut follower)
         .into_iter()
-        .find(|message| message.to == 2)
+        .find(|message| message.to.get() == 2)
         .unwrap();
     follower.step(heartbeat);
     leader.step(take_messages(&mut follower).pop().unwrap());
@@ -105,18 +105,30 @@ fn catch_up_batches_respect_entry_limits_and_progress_modes() {
     let request = first_batch
         .iter()
         .find_map(|message| match &message.msg {
-            Message::AppendEntries(request) if message.to == 2 => Some(request),
+            Message::AppendEntries(request) if message.to.get() == 2 => Some(request),
             _ => None,
         })
         .unwrap();
     assert_eq!(request.entries.len(), 2);
-    assert_eq!(leader.progress(2).unwrap().mode, ProgressMode::Probe);
-    assert_eq!(leader.progress(2).unwrap().inflight_batches, 1);
+    assert_eq!(
+        leader
+            .progress(raft::types::ReplicaId::must(2))
+            .unwrap()
+            .mode,
+        ProgressMode::Probe
+    );
+    assert_eq!(
+        leader
+            .progress(raft::types::ReplicaId::must(2))
+            .unwrap()
+            .inflight_batches,
+        1
+    );
 
     follower.step(
         first_batch
             .into_iter()
-            .find(|message| message.to == 2)
+            .find(|message| message.to.get() == 2)
             .unwrap(),
     );
     leader.step(take_messages(&mut follower).pop().unwrap());
@@ -125,10 +137,16 @@ fn catch_up_batches_respect_entry_limits_and_progress_modes() {
     let request = second_batch
         .iter()
         .find_map(|message| match &message.msg {
-            Message::AppendEntries(request) if message.to == 2 => Some(request),
+            Message::AppendEntries(request) if message.to.get() == 2 => Some(request),
             _ => None,
         })
         .unwrap();
     assert_eq!(request.entries.len(), 2);
-    assert_eq!(leader.progress(2).unwrap().mode, ProgressMode::Replicate);
+    assert_eq!(
+        leader
+            .progress(raft::types::ReplicaId::must(2))
+            .unwrap()
+            .mode,
+        ProgressMode::Replicate
+    );
 }

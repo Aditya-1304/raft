@@ -52,7 +52,7 @@ fn deliver(
     messages: Vec<Envelope<(), ()>>,
 ) {
     for msg in messages {
-        match msg.to {
+        match msg.to.get() {
             1 => n1.step(msg),
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -166,7 +166,7 @@ fn leader_steps_down_without_quorum_responses() {
     n1.tick(ELECTION_TIMEOUT);
 
     assert_eq!(n1.role(), &Role::Follower);
-    assert_eq!(n1.leader_id(), None);
+    assert_eq!(n1.leader_id().map(|id| id.get()), None);
     assert!(take_messages(&mut n1).is_empty());
 }
 

@@ -63,7 +63,16 @@ fn new_node(id: u64, peers: Vec<u64>) -> TestNode {
 }
 
 fn test_conf_state() -> ConfState {
-    ConfState::new(1, [1, 2, 3], []).unwrap()
+    ConfState::new(
+        1,
+        [
+            raft::types::ReplicaId::must(1),
+            raft::types::ReplicaId::must(2),
+            raft::types::ReplicaId::must(3),
+        ],
+        [],
+    )
+    .unwrap()
 }
 
 fn new_node_with_log(id: u64, peers: Vec<u64>, entries: &[(u64, u64, TestCmd)]) -> TestNode {
@@ -110,7 +119,7 @@ fn tick_to_timeout(node: &mut TestNode) {
 
 fn deliver(nodes: &mut [TestNode; 3], messages: Vec<Envelope<TestCmd, TestSnap>>) {
     for msg in messages {
-        let idx = (msg.to - 1) as usize;
+        let idx = (msg.to.get() - 1) as usize;
         nodes[idx].step(msg);
     }
 }
@@ -220,15 +229,19 @@ fn install_snapshot_waits_for_verified_external_image_before_acknowledging() {
     let snapshot = Snapshot::new(5, 2, test_conf_state(), 99);
 
     follower.step(Envelope {
-        from: 1,
-        to: 2,
-        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(3, 1, snapshot.metadata())),
+        from: raft::types::ReplicaId::must(1),
+        to: raft::types::ReplicaId::must(2),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+            3,
+            raft::types::ReplicaId::must(1),
+            snapshot.metadata(),
+        )),
     });
 
     let metadata_ready = take_ready(&mut follower);
 
     assert_eq!(follower.role(), &Role::Follower);
-    assert_eq!(follower.leader_id(), Some(1));
+    assert_eq!(follower.leader_id().map(|id| id.get()), Some(1));
     assert_eq!(follower.commit_index(), 0);
     assert_eq!(metadata_ready.snapshot_install, Some(snapshot.metadata()));
     assert!(metadata_ready.snapshot.is_none());
@@ -269,9 +282,13 @@ fn restoring_staged_snapshot_promotes_it_to_latest_snapshot() {
     let snapshot = Snapshot::new(4, 2, test_conf_state(), 123);
 
     follower.step(Envelope {
-        from: 1,
-        to: 2,
-        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(3, 1, snapshot.metadata())),
+        from: raft::types::ReplicaId::must(1),
+        to: raft::types::ReplicaId::must(2),
+        msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
+            3,
+            raft::types::ReplicaId::must(1),
+            snapshot.metadata(),
+        )),
     });
 
     take_ready(&mut follower);
@@ -305,7 +322,7 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
     let to_follower_2: Vec<_> = leader_ready
         .messages
         .into_iter()
-        .filter(|msg| msg.to == 2)
+        .filter(|msg| msg.to.get() == 2)
         .collect();
     assert_eq!(to_follower_2.len(), 1);
 
@@ -340,7 +357,7 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
     match &snapshot_send[0].msg {
         Message::InstallSnapshot(req) => {
             assert_eq!(req.term, nodes[0].current_term());
-            assert_eq!(req.leader_id, 1);
+            assert_eq!(req.leader_id.get(), 1);
             assert_eq!(req.metadata, snapshot.metadata());
         }
         _ => panic!("expected InstallSnapshot"),

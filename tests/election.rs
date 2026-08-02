@@ -39,7 +39,7 @@ fn assert_all_prevote(messages: &[Envelope<(), ()>], candidate_id: u64, term: u6
         match &msg.msg {
             Message::PreVote(req) => {
                 assert_eq!(req.term, term);
-                assert_eq!(req.candidate_id, candidate_id);
+                assert_eq!(req.candidate_id.get(), candidate_id);
                 assert_eq!(req.last_log_index, 0);
                 assert_eq!(req.last_log_term, 0);
             }
@@ -53,7 +53,7 @@ fn assert_all_request_vote(messages: &[Envelope<(), ()>], candidate_id: u64, ter
         match &msg.msg {
             Message::RequestVote(req) => {
                 assert_eq!(req.term, term);
-                assert_eq!(req.candidate_id, candidate_id);
+                assert_eq!(req.candidate_id.get(), candidate_id);
                 assert_eq!(req.last_log_index, 0);
                 assert_eq!(req.last_log_term, 0);
             }
@@ -77,7 +77,7 @@ fn one_leader_is_elected() {
     assert_all_prevote(&prevotes, 1, 1);
 
     for msg in prevotes {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             _ => unreachable!(),
@@ -108,7 +108,7 @@ fn one_leader_is_elected() {
     assert_all_request_vote(&vote_requests, 1, 1);
 
     for msg in vote_requests {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             _ => unreachable!(),
@@ -124,7 +124,7 @@ fn one_leader_is_elected() {
     }
 
     assert_eq!(n1.role(), &Role::Leader);
-    assert_eq!(n1.leader_id(), Some(1));
+    assert_eq!(n1.leader_id().map(|id| id.get()), Some(1));
 }
 
 #[test]
@@ -141,11 +141,11 @@ fn stale_vote_request_is_rejected() {
     let mut voter = RaftNode::new(2, vec![1, 3], log, stable, 5, 2);
 
     voter.step(Envelope {
-        from: 1,
-        to: 2,
+        from: raft::types::ReplicaId::must(1),
+        to: raft::types::ReplicaId::must(2),
         msg: Message::RequestVote(RequestVoteRequest {
             term: 2,
-            candidate_id: 1,
+            candidate_id: raft::types::ReplicaId::must(1),
             last_log_index: 0,
             last_log_term: 0,
         }),
@@ -182,7 +182,7 @@ fn split_vote_eventually_resolves() {
     let mut delayed_prevotes = Vec::new();
 
     for msg in prevotes_1 {
-        match msg.to {
+        match msg.to.get() {
             3 => n3.step(msg),
             2 | 4 => delayed_prevotes.push(msg),
             _ => unreachable!(),
@@ -190,7 +190,7 @@ fn split_vote_eventually_resolves() {
     }
 
     for msg in prevotes_2 {
-        match msg.to {
+        match msg.to.get() {
             4 => n4.step(msg),
             1 | 3 => delayed_prevotes.push(msg),
             _ => unreachable!(),
@@ -210,7 +210,7 @@ fn split_vote_eventually_resolves() {
     assert_ne!(n2.role(), &Role::Leader);
 
     for msg in delayed_prevotes {
-        match msg.to {
+        match msg.to.get() {
             1 => n1.step(msg),
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -226,7 +226,7 @@ fn split_vote_eventually_resolves() {
     prevote_responses.extend(take_messages(&mut n4));
 
     for msg in prevote_responses {
-        match msg.to {
+        match msg.to.get() {
             1 => n1.step(msg),
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -246,7 +246,7 @@ fn split_vote_eventually_resolves() {
     let mut delayed_votes = Vec::new();
 
     for msg in vote_requests_1 {
-        match msg.to {
+        match msg.to.get() {
             3 => n3.step(msg),
             2 | 4 => delayed_votes.push(msg),
             _ => unreachable!(),
@@ -254,7 +254,7 @@ fn split_vote_eventually_resolves() {
     }
 
     for msg in vote_requests_2 {
-        match msg.to {
+        match msg.to.get() {
             4 => n4.step(msg),
             1 | 3 => delayed_votes.push(msg),
             _ => unreachable!(),
@@ -272,7 +272,7 @@ fn split_vote_eventually_resolves() {
     assert_ne!(n2.role(), &Role::Leader);
 
     for msg in delayed_votes {
-        match msg.to {
+        match msg.to.get() {
             1 => n1.step(msg),
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -288,7 +288,7 @@ fn split_vote_eventually_resolves() {
     vote_cleanup.extend(take_messages(&mut n4));
 
     for msg in vote_cleanup {
-        match msg.to {
+        match msg.to.get() {
             1 => n1.step(msg),
             2 => n2.step(msg),
             3 => n3.step(msg),
@@ -306,7 +306,7 @@ fn split_vote_eventually_resolves() {
     assert_all_prevote(&prevote_retry, 1, 2);
 
     for msg in prevote_retry {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             4 => n4.step(msg),
@@ -327,7 +327,7 @@ fn split_vote_eventually_resolves() {
     assert_all_request_vote(&vote_retry, 1, 2);
 
     for msg in vote_retry {
-        match msg.to {
+        match msg.to.get() {
             2 => n2.step(msg),
             3 => n3.step(msg),
             4 => n4.step(msg),
@@ -345,7 +345,7 @@ fn split_vote_eventually_resolves() {
     }
 
     assert_eq!(n1.role(), &Role::Leader);
-    assert_eq!(n1.leader_id(), Some(1));
+    assert_eq!(n1.leader_id().map(|id| id.get()), Some(1));
 }
 
 #[test]

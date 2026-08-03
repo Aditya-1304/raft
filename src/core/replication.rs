@@ -1,11 +1,11 @@
 use crate::{
-    entry::LogEntry,
+    entry::{EntryPayload, LogEntry},
     message::{
         AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
         InstallSnapshotResponse, Message,
     },
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{LogIndex, NodeId, ProgressMode, Role, Term},
+    types::{ConfChangeError, ConfState, LogIndex, NodeId, ProgressMode, Role, Term},
 };
 
 use super::node::RaftNode;
@@ -128,10 +128,10 @@ where
         &mut self,
         from: NodeId,
         request: AppendEntriesRequest<C>,
-    ) {
+    ) -> Result<(), ConfChangeError> {
         if request.term < self.current_term() {
             self.reject_append_entries(from, None, self.last_log_index().saturating_add(1));
-            return;
+            return Ok(());
         }
 
         self.become_follower(request.term, Some(request.leader_id));
@@ -141,14 +141,16 @@ where
             self.check_prev_log_match(request.prev_log_index, request.prev_log_term)
         {
             self.reject_append_entries(from, conflict_term, conflict_index);
-            return;
+            return Ok(());
         }
 
+        self.validate_append_configurations(request.prev_log_index, &request.entries)?;
         self.append_from_leader(&request.entries);
         self.follow_leader_commit(request.leader_commit);
 
         let matched_index = request.prev_log_index + request.entries.len() as LogIndex;
         self.accept_append_entries(from, matched_index);
+        Ok(())
     }
 
     pub(crate) fn handle_append_entries_response_from(
@@ -463,6 +465,42 @@ where
             self.refresh_pending_conf_change();
             self.refresh_uncommitted_bytes();
         }
+    }
+
+    /// Validates the configuration sequence that would exist after this append.
+    ///
+    /// The committed `ConfState` is authoritative. Existing uncommitted entries
+    /// through `prev_log_index` form the retained prefix, while incoming entries
+    /// replace the suffix. Validation occurs before any log mutation so a bad
+    /// leader payload cannot become durable or receive an append acknowledgement.
+    fn validate_append_configurations(
+        &self,
+        prev_log_index: LogIndex,
+        entries: &[LogEntry<C>],
+    ) -> Result<(), ConfChangeError> {
+        let mut prospective: ConfState = self.conf_state.clone();
+        let first_uncommitted = self.commit_index.saturating_add(1);
+
+        if prev_log_index >= first_uncommitted {
+            let retained_count =
+                usize::try_from(prev_log_index - first_uncommitted + 1).unwrap_or(usize::MAX);
+            for entry in self.log.entries(first_uncommitted, retained_count) {
+                if let EntryPayload::Configuration(change) = entry.payload {
+                    prospective = prospective.apply(&change)?;
+                }
+            }
+        }
+
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.index > self.commit_index)
+        {
+            if let EntryPayload::Configuration(change) = &entry.payload {
+                prospective = prospective.apply(change)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn follow_leader_commit(&mut self, leader_commit: LogIndex) {

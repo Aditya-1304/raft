@@ -68,9 +68,16 @@ where
         self.set_hard_state(hs);
 
         for entry in &newly_committed {
-            if let EntryPayload::Configuration(change) = &entry.payload
-                && let Ok(next) = self.conf_state.apply(change)
-            {
+            if let EntryPayload::Configuration(change) = &entry.payload {
+                // Configuration entries are validated before proposal, before
+                // follower append, and while reconstructing a durable suffix.
+                // Reaching this point with an invalid transition is therefore
+                // an internal safety invariant violation, never a condition to
+                // ignore while advancing the committed quorum state.
+                let next = self
+                    .conf_state
+                    .apply(change)
+                    .expect("committed configuration entry was not prevalidated");
                 self.install_conf_state(next);
             }
         }

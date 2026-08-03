@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum ProposeError {
+    RecoveryRequired,
     NotLeader,
     ConfigurationChangePending,
     InvalidConfiguration(ConfChangeError),
@@ -40,16 +41,19 @@ pub enum ProposeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftError {
+    RecoveryRequired,
     TermExhausted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepError {
+    RecoveryRequired,
     WrongDestination { expected: NodeId, actual: NodeId },
     UnknownReplica(NodeId),
     PayloadIdentityMismatch { envelope: NodeId, payload: NodeId },
     IndexOverflow,
     InvalidSnapshotConfiguration(ConfStateError),
+    InvalidConfigurationTransition(ConfChangeError),
 }
 
 /// Per-group resource limits enforced by the pure Raft core.
@@ -91,10 +95,15 @@ pub enum InitError {
         last_index: LogIndex,
     },
     MissingSnapshotBoundaryTerm(LogIndex),
+    InvalidPendingConfiguration {
+        index: LogIndex,
+        error: ConfChangeError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotInstallError {
+    RecoveryRequired,
     NoInstallPending,
     MetadataMismatch {
         expected: Box<SnapshotMetadata>,
@@ -159,6 +168,9 @@ where
     pub(crate) soft_state_changed: bool,
 
     pub(crate) pending_ready: Option<Ready<C, S>>,
+    /// Identifies the Ready whose shared durability outcome cannot be proven.
+    /// This state is deliberately irreversible within one node lifetime.
+    pub(crate) recovery_required_ready_id: Option<ReadyId>,
     pub(crate) next_ready_id: u64,
     pub(crate) snapshot_awaiting_restore: Option<LogIndex>,
     pub(crate) pending_conf_change_index: Option<LogIndex>,
@@ -308,11 +320,21 @@ where
 
         let durable_log_index = logical_log.last_index();
 
-        let pending_conf_change_index = logical_log
-            .entries(hard_state.commit.saturating_add(1), usize::MAX)
-            .into_iter()
-            .find(|entry| matches!(entry.payload, EntryPayload::Configuration(_)))
-            .map(|entry| entry.index);
+        let uncommitted_entries =
+            logical_log.entries(hard_state.commit.saturating_add(1), usize::MAX);
+        let mut prospective_conf_state = conf_state.clone();
+        let mut pending_conf_change_index = None;
+        for entry in &uncommitted_entries {
+            if let EntryPayload::Configuration(change) = &entry.payload {
+                pending_conf_change_index.get_or_insert(entry.index);
+                prospective_conf_state = prospective_conf_state.apply(change).map_err(|error| {
+                    InitError::InvalidPendingConfiguration {
+                        index: entry.index,
+                        error,
+                    }
+                })?;
+            }
+        }
         let uncommitted_bytes = logical_log
             .entries(hard_state.commit.saturating_add(1), usize::MAX)
             .iter()
@@ -355,6 +377,7 @@ where
             latest_snapshot: None,
             soft_state_changed: false,
             pending_ready: None,
+            recovery_required_ready_id: None,
             next_ready_id: 1,
             snapshot_awaiting_restore: None,
             pending_conf_change_index,
@@ -374,6 +397,9 @@ where
         cmd: C,
         encoded_len: usize,
     ) -> Result<LogIndex, ProposeError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(ProposeError::RecoveryRequired);
+        }
         if self.soft_state.role != Role::Leader {
             return Err(ProposeError::NotLeader);
         }
@@ -405,6 +431,9 @@ where
     /// Only one uncommitted configuration entry may exist at a time. The
     /// configuration becomes authoritative only when that log entry commits.
     pub fn propose_conf_change(&mut self, change: ConfChange) -> Result<LogIndex, ProposeError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(ProposeError::RecoveryRequired);
+        }
         if self.soft_state.role != Role::Leader {
             return Err(ProposeError::NotLeader);
         }
@@ -462,6 +491,11 @@ where
     /// The same generation remains observable until `advance_persisted`
     /// acknowledges that its persistence portion is durable.
     pub fn ready(&mut self) -> Option<Ready<C, S>> {
+        // An outcome-unknown Ready is retained for diagnostics, but it must
+        // never be surfaced as retryable work in the same process lifetime.
+        if self.recovery_required_ready_id.is_some() {
+            return None;
+        }
         if let Some(ready) = self.pending_ready.as_ref() {
             return Some(ready.clone());
         }
@@ -497,6 +531,9 @@ where
     /// This method does not perform I/O. RagnorDB must call it only after the
     /// ordered A-WAL batch has synchronized through its exact final LSN.
     pub fn advance_persisted(&mut self, ready_id: ReadyId) -> Result<(), AdvanceError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(AdvanceError::RecoveryRequired);
+        }
         let Some(ready) = self.pending_ready.as_ref() else {
             return Err(AdvanceError::NoReadyPending);
         };
@@ -526,6 +563,9 @@ where
 
     /// Advances the state-machine frontier after successful ordered apply.
     pub fn advance_applied(&mut self, applied_through: LogIndex) -> Result<(), AdvanceError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(AdvanceError::RecoveryRequired);
+        }
         if applied_through < self.last_applied {
             return Err(AdvanceError::AppliedIndexRegressed {
                 current: self.last_applied,
@@ -569,6 +609,9 @@ where
         &mut self,
         ready: &Ready<C, S>,
     ) -> Result<(), AdvanceError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(AdvanceError::RecoveryRequired);
+        }
         let Some(pending) = self.pending_ready.as_ref() else {
             return Err(AdvanceError::NoReadyPending);
         };
@@ -622,6 +665,9 @@ where
         &mut self,
         snapshot: Snapshot<S>,
     ) -> Result<(), SnapshotInstallError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(SnapshotInstallError::RecoveryRequired);
+        }
         let Some(from) = self.snapshot_install_source else {
             return Err(SnapshotInstallError::NoInstallPending);
         };
@@ -670,6 +716,46 @@ where
         self.durable_log_index
     }
 
+    /// Returns the outstanding Ready whose durable result became unknowable.
+    ///
+    /// Once set, this marker cannot be cleared on the live instance. The host
+    /// must restart and reconstruct the group from the recovered durable prefix.
+    pub fn recovery_required_ready_id(&self) -> Option<ReadyId> {
+        self.recovery_required_ready_id
+    }
+
+    /// Permanently fences this live node after an ambiguous persistence result.
+    ///
+    /// The exact pending generation is required so a stale asynchronous I/O
+    /// completion cannot accidentally fence a different Ready. A definitely
+    /// failed persistence attempt must not call this method; that Ready remains
+    /// available for a host-controlled retry.
+    pub fn report_persistence_outcome_unknown(
+        &mut self,
+        ready_id: ReadyId,
+    ) -> Result<(), AdvanceError> {
+        if let Some(unknown_ready_id) = self.recovery_required_ready_id {
+            return if unknown_ready_id == ready_id {
+                Ok(())
+            } else {
+                Err(AdvanceError::RecoveryRequired)
+            };
+        }
+
+        let Some(ready) = self.pending_ready.as_ref() else {
+            return Err(AdvanceError::NoReadyPending);
+        };
+        if ready.id != ready_id {
+            return Err(AdvanceError::ReadyMismatch {
+                expected: ready.id,
+                actual: ready_id,
+            });
+        }
+
+        self.recovery_required_ready_id = Some(ready_id);
+        Ok(())
+    }
+
     pub fn conf_state(&self) -> &ConfState {
         &self.conf_state
     }
@@ -691,7 +777,8 @@ where
     }
 
     pub fn has_ready(&self) -> bool {
-        self.pending_ready.is_some() || self.has_staged_ready()
+        self.recovery_required_ready_id.is_none()
+            && (self.pending_ready.is_some() || self.has_staged_ready())
     }
 
     pub fn first_log_index(&self) -> LogIndex {

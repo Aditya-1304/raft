@@ -7,7 +7,7 @@ use std::{
 
 use raft::{
     core::{
-        node::RaftNode,
+        node::{ProposeError, RaftError, RaftNode},
         ready::{AdvanceError, ReadyId},
     },
     storage::{
@@ -181,4 +181,36 @@ fn stale_persistence_completion_cannot_acknowledge_a_new_generation() {
 
     // Rejecting the stale completion must leave the current generation intact.
     assert_eq!(node.ready(), Some(proposal_ready));
+}
+
+/// Realistic bug caught:
+///
+/// When a shared-WAL synchronization outcome is unknown, retrying the same
+/// Ready or continuing to accept logical work can release messages or client
+/// results whose durable prefix cannot be proven. The live node must remain
+/// fenced until restart reconstructs the authoritative durable prefix.
+#[test]
+fn uncertain_persistence_outcome_fail_stops_the_live_node() {
+    let dir = TestDir::new();
+    let mut node = new_node(&dir);
+    elect_and_persist(&mut node);
+
+    node.propose(13).unwrap();
+    let ready = node.ready().expect("proposal must produce Ready");
+
+    node.report_persistence_outcome_unknown(ready.id).unwrap();
+
+    assert_eq!(node.recovery_required_ready_id(), Some(ready.id));
+    assert_eq!(node.ready(), None);
+    assert!(!node.has_ready());
+    assert_eq!(
+        node.advance_persisted(ready.id),
+        Err(AdvanceError::RecoveryRequired)
+    );
+    assert_eq!(
+        node.advance_applied(ready.apply_through().unwrap()),
+        Err(AdvanceError::RecoveryRequired)
+    );
+    assert_eq!(node.propose(14), Err(ProposeError::RecoveryRequired));
+    assert_eq!(node.tick_checked(1), Err(RaftError::RecoveryRequired));
 }

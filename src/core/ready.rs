@@ -74,6 +74,9 @@ impl<C, S> Ready<C, S> {
 /// diverge from the ordered Ready stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvanceError {
+    /// The durable outcome of the outstanding Ready is unknown. Only a fresh
+    /// node reconstructed from durable storage may resume consensus work.
+    RecoveryRequired,
     NoReadyPending,
     ReadyMismatch {
         expected: ReadyId,

@@ -22,6 +22,9 @@ where
     }
 
     pub fn tick_checked(&mut self, ticks: u64) -> Result<(), RaftError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(RaftError::RecoveryRequired);
+        }
         match self.soft_state.role {
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(ticks);
@@ -55,6 +58,9 @@ where
     }
 
     pub fn step_checked(&mut self, envelope: Envelope<C, S>) -> Result<(), StepError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(StepError::RecoveryRequired);
+        }
         if envelope.to != self.id {
             return Err(StepError::WrongDestination {
                 expected: self.id,
@@ -128,7 +134,8 @@ where
                     self.prevote_phase = false;
                     self.leader_recent_active.clear();
                 }
-                self.handle_append_entries_request(from, request);
+                self.handle_append_entries_request(from, request)
+                    .map_err(StepError::InvalidConfigurationTransition)?;
             }
             Message::AppendEntriesResponse(response) => {
                 self.handle_append_entries_response_from(from, response);

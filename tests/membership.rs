@@ -1,10 +1,10 @@
 use raft::{
     core::node::{InitError, RaftNode, StepError},
-    entry::EntryPayload,
-    message::{Envelope, Message, PreVoteResponse, RequestVoteRequest},
+    entry::{EntryPayload, LogEntry},
+    message::{AppendEntriesRequest, Envelope, Message, PreVoteResponse, RequestVoteRequest},
     storage::mem::MemStorage,
-    traits::stable_store::StableStore,
-    types::{ConfChange, ConfChangeKind, ConfState, ReplicaId, Role},
+    traits::{log_store::LogStore, stable_store::StableStore},
+    types::{ConfChange, ConfChangeError, ConfChangeKind, ConfState, ReplicaId, Role},
 };
 
 type TestStorage = MemStorage<(), ()>;
@@ -114,6 +114,49 @@ fn restart_requires_a_durable_configuration() {
     ));
 }
 
+/// Realistic bug caught:
+///
+/// Restart must not admit a durable uncommitted suffix whose membership epochs
+/// cannot follow the last committed `ConfState`. Otherwise a later normal entry
+/// could commit the malformed suffix after recovery and change quorum state
+/// nondeterministically.
+#[test]
+fn restart_rejects_an_invalid_pending_configuration_suffix() {
+    let durable = ConfState::new(1, [ReplicaId::must(1), ReplicaId::must(2)], []).unwrap();
+    let mut stable = MemStorage::<(), ()>::new();
+    stable.set_conf_state(durable);
+
+    let mut log = MemStorage::<(), ()>::new();
+    log.append(&[LogEntry {
+        index: 1,
+        term: 1,
+        encoded_len: 24,
+        payload: EntryPayload::Configuration(ConfChange {
+            expected_version: 9,
+            kind: ConfChangeKind::AddLearner(ReplicaId::must(3)),
+        }),
+    }]);
+
+    let result = RaftNode::<(), (), TestStorage, TestStorage>::restart(
+        ReplicaId::must(1),
+        log,
+        stable,
+        5,
+        2,
+    );
+
+    assert!(matches!(
+        result,
+        Err(InitError::InvalidPendingConfiguration {
+            index: 1,
+            error: ConfChangeError::VersionMismatch {
+                expected: 1,
+                actual: 9,
+            },
+        })
+    ));
+}
+
 #[test]
 fn legacy_restart_does_not_replace_durable_membership_with_changed_peers() {
     let durable = ConfState::new(
@@ -170,4 +213,59 @@ fn committed_configuration_entry_emits_and_persists_conf_state() {
     assert_eq!(emitted.version, 2);
     assert!(emitted.learners.contains(&ReplicaId::must(2)));
     assert_eq!(node.durable_conf_state(), Some(&emitted));
+}
+
+/// Realistic bug caught:
+///
+/// A follower which silently accepts a configuration entry with the wrong
+/// epoch can persist and acknowledge a log whose committed quorum state differs
+/// from the leader. Invalid membership transitions must be rejected before the
+/// follower appends or commits them.
+#[test]
+fn follower_rejects_invalid_configuration_before_append_or_commit() {
+    let initial = ConfState::new(1, [ReplicaId::must(1), ReplicaId::must(2)], []).unwrap();
+    let mut follower: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        initial.clone(),
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+    persist_one_ready(&mut follower);
+
+    let result = follower.step_checked(Envelope {
+        from: ReplicaId::must(2),
+        to: ReplicaId::must(1),
+        msg: Message::AppendEntries(AppendEntriesRequest {
+            term: 1,
+            leader_id: ReplicaId::must(2),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                index: 1,
+                term: 1,
+                encoded_len: 24,
+                payload: EntryPayload::Configuration(ConfChange {
+                    expected_version: 99,
+                    kind: ConfChangeKind::AddLearner(ReplicaId::must(3)),
+                }),
+            }],
+            leader_commit: 1,
+        }),
+    });
+
+    assert_eq!(
+        result,
+        Err(StepError::InvalidConfigurationTransition(
+            ConfChangeError::VersionMismatch {
+                expected: 1,
+                actual: 99,
+            }
+        ))
+    );
+    assert_eq!(follower.last_log_index(), 0);
+    assert_eq!(follower.commit_index(), 0);
+    assert_eq!(follower.conf_state(), &initial);
 }

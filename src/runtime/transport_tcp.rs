@@ -12,8 +12,8 @@ use crate::{
     entry::{EntryPayload, LogEntry},
     message::{
         AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
-        InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
-        RequestVoteResponse,
+        InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, ReadIndexRequest,
+        ReadIndexResponse, RequestVoteRequest, RequestVoteResponse,
     },
     storage::codec::{CommandCodec, SnapshotCodec},
     traits::transport::Transport,
@@ -28,6 +28,8 @@ const TAG_APPEND_ENTRIES_REQUEST: u8 = 5;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 6;
 const TAG_INSTALL_SNAPSHOT_REQUEST: u8 = 7;
 const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
+const TAG_READ_INDEX_REQUEST: u8 = 9;
+const TAG_READ_INDEX_RESPONSE: u8 = 10;
 const MAX_WIRE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_APPEND_ENTRIES: usize = 4_096;
 
@@ -267,6 +269,14 @@ where
                 push_u8(&mut buf, TAG_INSTALL_SNAPSHOT_RESPONSE);
                 self.encode_install_snapshot_response(&mut buf, response);
             }
+            Message::ReadIndex(request) => {
+                push_u8(&mut buf, TAG_READ_INDEX_REQUEST);
+                self.encode_read_index_request(&mut buf, request);
+            }
+            Message::ReadIndexResponse(response) => {
+                push_u8(&mut buf, TAG_READ_INDEX_RESPONSE);
+                self.encode_read_index_response(&mut buf, response);
+            }
         }
 
         Ok(buf)
@@ -302,6 +312,12 @@ where
             TAG_INSTALL_SNAPSHOT_RESPONSE => Message::InstallSnapshotResponse(
                 self.decode_install_snapshot_response(&mut cursor)?,
             ),
+            TAG_READ_INDEX_REQUEST => {
+                Message::ReadIndex(self.decode_read_index_request(&mut cursor)?)
+            }
+            TAG_READ_INDEX_RESPONSE => {
+                Message::ReadIndexResponse(self.decode_read_index_response(&mut cursor)?)
+            }
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -547,6 +563,38 @@ where
             term: read_u64(cursor)?,
             success: read_bool(cursor)?,
             last_included_index: read_u64(cursor)?,
+        })
+    }
+
+    fn encode_read_index_request(&self, buf: &mut Vec<u8>, request: &ReadIndexRequest) {
+        push_u64(buf, request.term);
+        push_u64(buf, request.leader_id);
+        push_bytes(buf, &request.context);
+    }
+
+    fn decode_read_index_request(
+        &self,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> io::Result<ReadIndexRequest> {
+        Ok(ReadIndexRequest {
+            term: read_u64(cursor)?,
+            leader_id: read_replica_id(cursor)?,
+            context: read_bytes(cursor)?,
+        })
+    }
+
+    fn encode_read_index_response(&self, buf: &mut Vec<u8>, response: &ReadIndexResponse) {
+        push_u64(buf, response.term);
+        push_bytes(buf, &response.context);
+    }
+
+    fn decode_read_index_response(
+        &self,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> io::Result<ReadIndexResponse> {
+        Ok(ReadIndexResponse {
+            term: read_u64(cursor)?,
+            context: read_bytes(cursor)?,
         })
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
+    core::read_index::PendingReadIndex,
     core::ready::{AdvanceError, Ready, ReadyId},
     entry::{EntryPayload, LogEntry},
     message::Envelope,
@@ -156,6 +157,9 @@ where
 
     pub(crate) outbox: Vec<Envelope<C, S>>,
     pub(crate) committed: Vec<LogEntry<C>>,
+    pub(crate) pending_read_states: Vec<crate::core::read_index::ReadState>,
+    pub(crate) pending_read_indexes: Vec<PendingReadIndex>,
+    pub(crate) read_index_activation_term: Option<Term>,
 
     pub(crate) pending_hard_state: Option<HardState>,
     pub(crate) pending_conf_state: Option<ConfState>,
@@ -367,6 +371,9 @@ where
             leader_recent_active: HashSet::new(),
             outbox: Vec::new(),
             committed: Vec::new(),
+            pending_read_states: Vec::new(),
+            pending_read_indexes: Vec::new(),
+            read_index_activation_term: None,
             pending_hard_state: None,
             pending_conf_state: None,
             pending_entries: Vec::new(),
@@ -514,6 +521,7 @@ where
             snapshot_install: self.pending_snapshot_install.take(),
             messages: std::mem::take(&mut self.outbox),
             committed_entries: std::mem::take(&mut self.committed),
+            read_states: std::mem::take(&mut self.pending_read_states),
             soft_state_changed: self.soft_state_changed,
         };
 
@@ -888,6 +896,7 @@ where
             || self.pending_snapshot_install.is_some()
             || !self.outbox.is_empty()
             || !self.committed.is_empty()
+            || !self.pending_read_states.is_empty()
             || self.soft_state_changed
     }
 

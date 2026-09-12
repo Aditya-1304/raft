@@ -111,6 +111,12 @@ where
                     .validate()
                     .map_err(StepError::InvalidSnapshotConfiguration)?;
             }
+            Message::ReadIndex(request) if request.leader_id != envelope.from => {
+                return Err(StepError::PayloadIdentityMismatch {
+                    envelope: envelope.from,
+                    payload: request.leader_id,
+                });
+            }
             _ => {}
         }
 
@@ -149,6 +155,12 @@ where
             }
             Message::InstallSnapshotResponse(response) => {
                 self.handle_install_snapshot_response_from(from, response);
+            }
+            Message::ReadIndex(request) => {
+                self.handle_read_index_request(from, request);
+            }
+            Message::ReadIndexResponse(response) => {
+                self.handle_read_index_response_from(from, response);
             }
         }
         Ok(())
@@ -328,6 +340,7 @@ where
     }
 
     fn become_leader(&mut self) {
+        self.clear_read_index_state();
         let next_index = self.last_log_index().saturating_add(1);
         let mut progress = HashMap::with_capacity(self.peers.len());
 

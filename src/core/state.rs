@@ -32,6 +32,7 @@ where
             return;
         }
 
+        self.clear_read_index_state();
         hs.current_term = term;
         hs.voted_for = None;
         self.set_hard_state(hs);
@@ -44,6 +45,9 @@ where
     }
 
     pub(crate) fn set_role(&mut self, role: Role) {
+        if role != Role::Leader {
+            self.clear_read_index_state();
+        }
         if self.soft_state.role != role {
             self.soft_state.role = role;
             self.soft_state_changed = true;

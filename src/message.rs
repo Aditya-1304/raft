@@ -79,6 +79,19 @@ pub struct InstallSnapshotResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadIndexRequest {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub context: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadIndexResponse {
+    pub term: Term,
+    pub context: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message<C, S> {
     PreVote(PreVoteRequest),
     PreVoteResponse(PreVoteResponse),
@@ -88,6 +101,8 @@ pub enum Message<C, S> {
     AppendEntriesResponse(AppendEntriesResponse),
     InstallSnapshot(InstallSnapshotRequest<S>),
     InstallSnapshotResponse(InstallSnapshotResponse),
+    ReadIndex(ReadIndexRequest),
+    ReadIndexResponse(ReadIndexResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

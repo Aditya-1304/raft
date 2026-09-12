@@ -1,4 +1,5 @@
 use crate::{
+    core::read_index::ReadState,
     entry::LogEntry,
     message::Envelope,
     types::{ConfState, HardState, LogIndex, Snapshot, SnapshotMetadata},
@@ -42,6 +43,7 @@ pub struct Ready<C, S> {
     pub snapshot_install: Option<SnapshotMetadata>,
     pub messages: Vec<Envelope<C, S>>,
     pub committed_entries: Vec<LogEntry<C>>,
+    pub read_states: Vec<ReadState>,
     pub soft_state_changed: bool,
 }
 
@@ -54,6 +56,7 @@ impl<C, S> Ready<C, S> {
             && self.snapshot_install.is_none()
             && self.messages.is_empty()
             && self.committed_entries.is_empty()
+            && self.read_states.is_empty()
             && !self.soft_state_changed
     }
 

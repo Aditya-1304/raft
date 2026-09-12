@@ -274,6 +274,14 @@ impl ConfState {
             });
         }
 
+        // The durable representation intentionally carries both voter sets so
+        // a joint configuration can survive snapshots and restart. Execution
+        // of the joint-consensus protocol is a later phase; accepting another
+        // transition here would create two concurrent membership owners.
+        if !self.outgoing_voters.is_empty() {
+            return Err(ConfChangeError::JointConsensusInProgress);
+        }
+
         let mut next = self.clone();
         next.version = self
             .version
@@ -345,6 +353,7 @@ pub enum ConfChangeError {
     NotLearner(ReplicaId),
     UnknownReplica(ReplicaId),
     WouldRemoveLastVoter,
+    JointConsensusInProgress,
     InvalidState(ConfStateError),
 }
 

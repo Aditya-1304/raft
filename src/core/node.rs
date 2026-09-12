@@ -88,6 +88,7 @@ impl Default for RaftLimits {
 pub enum InitError {
     InvalidConfiguration(ConfStateError),
     LocalReplicaNotMember(NodeId),
+    JoiningReplicaAlreadyMember(NodeId),
     AlreadyBootstrapped,
     MissingDurableConfiguration,
     ExistingDurableState,
@@ -124,6 +125,10 @@ where
     pub(crate) peers: Vec<NodeId>,
     pub(crate) conf_state: ConfState,
     pub(crate) durable_conf_state: Option<ConfState>,
+    /// A joining replica is intentionally outside the committed membership
+    /// until an applied `AddLearner` transition names it. It can receive
+    /// replication from current members, but it cannot campaign or propose.
+    pub(crate) joining: bool,
 
     pub(crate) soft_state: SoftState,
     /// Logical Raft state. Mutating this in-memory view never performs I/O.
@@ -251,6 +256,43 @@ where
         Ok(node)
     }
 
+    /// Creates an empty joining replica from the current group's durable
+    /// configuration without adding the local identity to that configuration.
+    ///
+    /// The joining node is a passive replication target until a committed
+    /// configuration entry promotes it into the learner set. This explicit
+    /// constructor prevents a host from accidentally treating a metadata
+    /// placement decision as consensus membership.
+    pub fn bootstrap_joining(
+        id: NodeId,
+        conf_state: ConfState,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> Result<Self, InitError> {
+        if stable.conf_state().is_some() {
+            return Err(InitError::AlreadyBootstrapped);
+        }
+        if stable.hard_state() != HardState::default() || log.last_index() != 0 {
+            return Err(InitError::ExistingDurableState);
+        }
+        if conf_state.contains(id) {
+            return Err(InitError::JoiningReplicaAlreadyMember(id));
+        }
+
+        let mut node = Self::from_conf_state_allowing_joining(
+            id,
+            conf_state.clone(),
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+        )?;
+        node.pending_conf_state = Some(conf_state);
+        Ok(node)
+    }
+
     /// Restarts exclusively from the committed configuration in stable state.
     pub fn restart(
         id: NodeId,
@@ -272,6 +314,33 @@ where
         )
     }
 
+    /// Restarts a replica whose local identity has not yet been committed into
+    /// the group's membership. Once `AddLearner` has applied, callers must use
+    /// the ordinary [`Self::restart`] path so removed identities cannot be
+    /// revived through a joining-only entry point.
+    pub fn restart_joining(
+        id: NodeId,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> Result<Self, InitError> {
+        let conf_state = stable
+            .conf_state()
+            .ok_or(InitError::MissingDurableConfiguration)?;
+        if conf_state.contains(id) {
+            return Err(InitError::JoiningReplicaAlreadyMember(id));
+        }
+        Self::from_conf_state_allowing_joining(
+            id,
+            conf_state,
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+        )
+    }
+
     fn from_conf_state(
         id: NodeId,
         conf_state: ConfState,
@@ -280,10 +349,49 @@ where
         election_timeout: u64,
         heartbeat_interval: u64,
     ) -> Result<Self, InitError> {
+        Self::from_conf_state_with_membership(
+            id,
+            conf_state,
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+            false,
+        )
+    }
+
+    fn from_conf_state_allowing_joining(
+        id: NodeId,
+        conf_state: ConfState,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> Result<Self, InitError> {
+        Self::from_conf_state_with_membership(
+            id,
+            conf_state,
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+            true,
+        )
+    }
+
+    fn from_conf_state_with_membership(
+        id: NodeId,
+        conf_state: ConfState,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+        allow_joining: bool,
+    ) -> Result<Self, InitError> {
         conf_state
             .validate()
             .map_err(InitError::InvalidConfiguration)?;
-        if !conf_state.contains(id) {
+        if !allow_joining && !conf_state.contains(id) {
             return Err(InitError::LocalReplicaNotMember(id));
         }
 
@@ -345,12 +453,14 @@ where
             .iter()
             .map(|entry| entry.encoded_len)
             .sum();
+        let joining = allow_joining && !conf_state.contains(id);
 
         Ok(Self {
             id,
             peers,
             durable_conf_state: stable.conf_state(),
             conf_state,
+            joining,
             soft_state: SoftState::default(),
             hard_state: hard_state.clone(),
             log: logical_log,
@@ -770,8 +880,21 @@ where
         &self.conf_state
     }
 
+    /// Returns whether this node is a passive joining replica that is not yet
+    /// part of the committed voter or learner set.
+    pub fn is_joining(&self) -> bool {
+        self.joining
+    }
+
     pub fn durable_conf_state(&self) -> Option<&ConfState> {
         self.durable_conf_state.as_ref()
+    }
+
+    /// Returns the first unapplied configuration entry, if any. Hosts use this
+    /// as an admission/status signal; only the applied entry changes the
+    /// authoritative membership exposed by [`Self::conf_state`].
+    pub fn pending_conf_change_index(&self) -> Option<LogIndex> {
+        self.pending_conf_change_index
     }
 
     pub fn soft_state(&self) -> &SoftState {
@@ -840,6 +963,27 @@ where
             .and_then(|leader| leader.progress.get(&replica_id))
     }
 
+    /// Returns the latest replication match index known for every replica.
+    ///
+    /// The local replica is included from its log frontier because the leader
+    /// progress map intentionally stores only remote replication state. A
+    /// sorted result keeps status snapshots deterministic for diagnostics and
+    /// tests even though the core stores remote progress in a hash map.
+    pub fn replication_match_indices(&self) -> Vec<(NodeId, LogIndex)> {
+        let mut matches = vec![(self.id, self.last_log_index())];
+        if let Some(leader_state) = self.leader_state.as_ref() {
+            matches.extend(
+                leader_state
+                    .progress
+                    .iter()
+                    .map(|(replica_id, progress)| (*replica_id, progress.match_index)),
+            );
+        }
+        matches.sort_unstable_by_key(|(replica_id, _)| *replica_id);
+        matches.dedup_by_key(|(replica_id, _)| *replica_id);
+        matches
+    }
+
     fn admit_proposal(&self, encoded_len: usize) -> Result<(), ProposeError> {
         if encoded_len > self.limits.max_proposal_bytes {
             return Err(ProposeError::ProposalTooLarge {
@@ -904,6 +1048,9 @@ where
 
     pub(crate) fn install_conf_state(&mut self, conf_state: ConfState) {
         debug_assert!(conf_state.validate().is_ok());
+        if self.joining {
+            self.joining = !conf_state.contains(self.id);
+        }
         self.conf_state = conf_state.clone();
         self.peers = conf_state
             .replication_targets()

@@ -99,6 +99,149 @@ fn learner_never_starts_an_election() {
 }
 
 #[test]
+fn explicit_joining_replica_is_passive_until_membership_is_committed() {
+    let conf_state = ConfState::new(1, [ReplicaId::must(1), ReplicaId::must(3)], []).unwrap();
+    let mut joining: TestNode = RaftNode::bootstrap_joining(
+        ReplicaId::must(2),
+        conf_state.clone(),
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+
+    joining.tick(100);
+
+    assert!(joining.is_joining());
+    assert_eq!(joining.role(), &Role::Follower);
+    assert_eq!(joining.current_term(), 0);
+    assert_eq!(joining.conf_state(), &conf_state);
+}
+
+#[test]
+fn joining_restart_is_not_available_after_local_membership_is_durable() {
+    let conf_state = ConfState::new(2, [ReplicaId::must(1), ReplicaId::must(2)], []).unwrap();
+    let mut stable = MemStorage::<(), ()>::new();
+    stable.set_conf_state(conf_state);
+
+    let result = RaftNode::<(), (), TestStorage, TestStorage>::restart_joining(
+        ReplicaId::must(2),
+        MemStorage::new(),
+        stable,
+        5,
+        2,
+    );
+
+    assert!(matches!(
+        result,
+        Err(InitError::JoiningReplicaAlreadyMember(id)) if id == ReplicaId::must(2)
+    ));
+}
+
+#[test]
+fn lagging_learner_cannot_be_promoted_before_the_committed_frontier() {
+    let initial = ConfState::new(1, [ReplicaId::must(1)], [ReplicaId::must(2)]).unwrap();
+    let mut node: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        initial,
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+
+    persist_one_ready(&mut node);
+    node.tick(node.current_election_timeout());
+    persist_one_ready(&mut node);
+    assert_eq!(node.role(), &Role::Leader);
+
+    let committed_index = node.propose(()).unwrap();
+    persist_one_ready(&mut node);
+    node.advance_applied(committed_index).unwrap();
+
+    let result = node.propose_conf_change(ConfChange {
+        expected_version: 1,
+        kind: ConfChangeKind::PromoteLearner(ReplicaId::must(2)),
+    });
+
+    assert_eq!(
+        result,
+        Err(raft::core::node::ProposeError::LearnerNotCaughtUp {
+            replica_id: ReplicaId::must(2),
+            match_index: 0,
+            commit_index: committed_index,
+        })
+    );
+    assert_eq!(node.last_log_index(), committed_index);
+}
+
+#[test]
+fn only_one_unapplied_configuration_change_is_admitted() {
+    let initial = ConfState::new(1, [ReplicaId::must(1)], []).unwrap();
+    let mut node: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        initial,
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+
+    persist_one_ready(&mut node);
+    node.tick(node.current_election_timeout());
+    persist_one_ready(&mut node);
+
+    node.propose_conf_change(ConfChange {
+        expected_version: 1,
+        kind: ConfChangeKind::AddLearner(ReplicaId::must(2)),
+    })
+    .unwrap();
+
+    let result = node.propose_conf_change(ConfChange {
+        expected_version: 1,
+        kind: ConfChangeKind::AddLearner(ReplicaId::must(3)),
+    });
+
+    assert_eq!(
+        result,
+        Err(raft::core::node::ProposeError::ConfigurationChangePending)
+    );
+}
+
+#[test]
+fn removing_the_last_voter_is_rejected_before_log_append() {
+    let initial = ConfState::new(1, [ReplicaId::must(1)], []).unwrap();
+    let mut node: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        initial,
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+
+    persist_one_ready(&mut node);
+    node.tick(node.current_election_timeout());
+    persist_one_ready(&mut node);
+    let before = node.last_log_index();
+
+    let result = node.propose_conf_change(ConfChange {
+        expected_version: 1,
+        kind: ConfChangeKind::RemoveReplica(ReplicaId::must(1)),
+    });
+
+    assert_eq!(
+        result,
+        Err(raft::core::node::ProposeError::CannotRemoveLeader)
+    );
+    assert_eq!(node.last_log_index(), before);
+}
+
+#[test]
 fn restart_requires_a_durable_configuration() {
     let result = RaftNode::<(), (), TestStorage, TestStorage>::restart(
         ReplicaId::must(1),
@@ -268,4 +411,24 @@ fn follower_rejects_invalid_configuration_before_append_or_commit() {
     assert_eq!(follower.last_log_index(), 0);
     assert_eq!(follower.commit_index(), 0);
     assert_eq!(follower.conf_state(), &initial);
+}
+
+/// Realistic bug caught:
+///
+/// The durable `ConfState` shape supports joint consensus so snapshots and
+/// recovery can preserve that state, but Slice 1 must not accidentally admit
+/// ordinary single-configuration changes while the joint state is active.
+/// Allowing one would make the next quorum transition ambiguous because the
+/// old and new voter sets would no longer have a single serialized owner.
+#[test]
+fn configuration_changes_are_rejected_while_joint_state_is_active() {
+    let mut state = ConfState::new(3, [ReplicaId::must(1), ReplicaId::must(2)], []).unwrap();
+    state.outgoing_voters.insert(ReplicaId::must(3));
+
+    let result = state.apply(&ConfChange {
+        expected_version: 3,
+        kind: ConfChangeKind::AddLearner(ReplicaId::must(4)),
+    });
+
+    assert!(result.is_err());
 }

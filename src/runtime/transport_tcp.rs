@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::{
+    core::read_index::MAX_READ_INDEX_CONTEXT_BYTES,
     entry::{EntryPayload, LogEntry},
     message::{
         AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
@@ -569,6 +570,7 @@ where
     fn encode_read_index_request(&self, buf: &mut Vec<u8>, request: &ReadIndexRequest) {
         push_u64(buf, request.term);
         push_u64(buf, request.leader_id);
+        push_u64(buf, request.request_id);
         push_bytes(buf, &request.context);
     }
 
@@ -579,12 +581,14 @@ where
         Ok(ReadIndexRequest {
             term: read_u64(cursor)?,
             leader_id: read_replica_id(cursor)?,
-            context: read_bytes(cursor)?,
+            request_id: read_u64(cursor)?,
+            context: read_bytes_limited(cursor, MAX_READ_INDEX_CONTEXT_BYTES, "ReadIndex context")?,
         })
     }
 
     fn encode_read_index_response(&self, buf: &mut Vec<u8>, response: &ReadIndexResponse) {
         push_u64(buf, response.term);
+        push_u64(buf, response.request_id);
         push_bytes(buf, &response.context);
     }
 
@@ -594,7 +598,8 @@ where
     ) -> io::Result<ReadIndexResponse> {
         Ok(ReadIndexResponse {
             term: read_u64(cursor)?,
-            context: read_bytes(cursor)?,
+            request_id: read_u64(cursor)?,
+            context: read_bytes_limited(cursor, MAX_READ_INDEX_CONTEXT_BYTES, "ReadIndex context")?,
         })
     }
 }
@@ -768,16 +773,24 @@ fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
 }
 
 fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
+    read_bytes_limited(cursor, MAX_WIRE_FRAME_BYTES, "byte field")
+}
+
+fn read_bytes_limited(
+    cursor: &mut Cursor<&[u8]>,
+    max_bytes: usize,
+    field_name: &str,
+) -> io::Result<Vec<u8>> {
     let len = usize::try_from(read_u64(cursor)?).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            "byte field length exceeds usize",
+            format!("{field_name} length exceeds usize"),
         )
     })?;
-    if len > MAX_WIRE_FRAME_BYTES {
+    if len > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("byte field length {len} exceeds {MAX_WIRE_FRAME_BYTES}"),
+            format!("{field_name} length {len} exceeds {max_bytes}"),
         ));
     }
     let mut buf = vec![0_u8; len];

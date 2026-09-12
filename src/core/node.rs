@@ -160,6 +160,7 @@ where
     pub(crate) pending_read_states: Vec<crate::core::read_index::ReadState>,
     pub(crate) pending_read_indexes: Vec<PendingReadIndex>,
     pub(crate) read_index_activation_term: Option<Term>,
+    pub(crate) next_read_index_id: u64,
 
     pub(crate) pending_hard_state: Option<HardState>,
     pub(crate) pending_conf_state: Option<ConfState>,
@@ -374,6 +375,7 @@ where
             pending_read_states: Vec::new(),
             pending_read_indexes: Vec::new(),
             read_index_activation_term: None,
+            next_read_index_id: 1,
             pending_hard_state: None,
             pending_conf_state: None,
             pending_entries: Vec::new(),

@@ -82,12 +82,16 @@ pub struct InstallSnapshotResponse {
 pub struct ReadIndexRequest {
     pub term: Term,
     pub leader_id: NodeId,
+    /// Core-generated nonce that prevents a delayed response from completing
+    /// a later request which reused the same opaque host context.
+    pub request_id: u64,
     pub context: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadIndexResponse {
     pub term: Term,
+    pub request_id: u64,
     pub context: Vec<u8>,
 }
 

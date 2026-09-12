@@ -8,6 +8,20 @@ use crate::{
 
 use super::node::RaftNode;
 
+/// Maximum number of ReadIndex requests which may remain unresolved on one
+/// Raft node. A quorum outage must produce bounded backpressure rather than
+/// allowing opaque contexts to grow without limit.
+pub const MAX_PENDING_READ_INDEXES: usize = 1_024;
+
+/// Maximum size of one opaque ReadIndex context. Contexts are correlation data,
+/// not a transport for application payloads, so large values are rejected at
+/// the consensus boundary.
+pub const MAX_READ_INDEX_CONTEXT_BYTES: usize = 4 * 1_024;
+
+/// Maximum aggregate context bytes retained by unresolved or not-yet-released
+/// ReadIndex states on one Raft node.
+pub const MAX_PENDING_READ_INDEX_CONTEXT_BYTES: usize = 4 * 1_024 * 1_024;
+
 /// A quorum-confirmed read barrier delivered through `Ready`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadState {
@@ -24,6 +38,17 @@ pub struct ReadState {
 pub enum ReadIndexError {
     RecoveryRequired,
     NotLeader,
+    EmptyContext,
+    RequestIdExhausted,
+    PendingReadIndexLimitReached {
+        limit: usize,
+    },
+    ReadIndexContextTooLarge {
+        max_bytes: usize,
+    },
+    PendingReadIndexBytesLimitReached {
+        limit: usize,
+    },
     ActivationTermMismatch {
         expected: Term,
         actual: Term,
@@ -43,6 +68,7 @@ pub enum ReadIndexError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingReadIndex {
     pub(crate) term: Term,
+    pub(crate) request_id: u64,
     pub(crate) context: Vec<u8>,
     pub(crate) acknowledgements: HashSet<NodeId>,
 }
@@ -100,15 +126,47 @@ where
         if self.soft_state.role != Role::Leader {
             return Err(ReadIndexError::NotLeader);
         }
+        if context.is_empty() {
+            return Err(ReadIndexError::EmptyContext);
+        }
+        if context.len() > MAX_READ_INDEX_CONTEXT_BYTES {
+            return Err(ReadIndexError::ReadIndexContextTooLarge {
+                max_bytes: MAX_READ_INDEX_CONTEXT_BYTES,
+            });
+        }
         let term = self.current_term();
         if self.read_index_activation_term != Some(term) {
             return Err(ReadIndexError::NotActivated { term });
         }
+        if self.pending_read_index_count() >= MAX_PENDING_READ_INDEXES {
+            return Err(ReadIndexError::PendingReadIndexLimitReached {
+                limit: MAX_PENDING_READ_INDEXES,
+            });
+        }
+        if self
+            .pending_read_index_context_bytes()
+            .saturating_add(context.len())
+            > MAX_PENDING_READ_INDEX_CONTEXT_BYTES
+        {
+            return Err(ReadIndexError::PendingReadIndexBytesLimitReached {
+                limit: MAX_PENDING_READ_INDEX_CONTEXT_BYTES,
+            });
+        }
 
+        let request_id = self
+            .next_read_index_id
+            .checked_add(1)
+            .map(|next| {
+                let current = self.next_read_index_id;
+                self.next_read_index_id = next;
+                current
+            })
+            .ok_or(ReadIndexError::RequestIdExhausted)?;
         let mut acknowledgements = HashSet::new();
         acknowledgements.insert(self.id);
         self.pending_read_indexes.push(PendingReadIndex {
             term,
+            request_id,
             context: context.clone(),
             acknowledgements,
         });
@@ -125,6 +183,7 @@ where
                 msg: Message::ReadIndex(ReadIndexRequest {
                     term,
                     leader_id: self.id,
+                    request_id,
                     context: context.clone(),
                 }),
             });
@@ -141,11 +200,27 @@ where
     pub(crate) fn clear_read_index_state(&mut self) {
         self.read_index_activation_term = None;
         self.pending_read_indexes.clear();
+        self.pending_read_states.clear();
+        if let Some(ready) = self.pending_ready.as_mut() {
+            // A Ready can remain outstanding while a higher-term message
+            // arrives. ReadStates from the old leader term must not escape
+            // that durable boundary after the term change.
+            ready.read_states.clear();
+        }
     }
 
     pub(crate) fn handle_read_index_request(&mut self, from: NodeId, request: ReadIndexRequest) {
-        if !self.conf_state.is_voter(from) {
+        if !self.conf_state.is_voter(from)
+            || request.request_id == 0
+            || request.context.is_empty()
+            || request.context.len() > MAX_READ_INDEX_CONTEXT_BYTES
+        {
             return;
+        }
+
+        if request.term >= self.current_term() {
+            self.prevote_phase = false;
+            self.leader_recent_active.clear();
         }
 
         if request.term < self.current_term() {
@@ -154,6 +229,7 @@ where
                 to: from,
                 msg: Message::ReadIndexResponse(ReadIndexResponse {
                     term: self.current_term(),
+                    request_id: request.request_id,
                     context: request.context,
                 }),
             });
@@ -167,6 +243,7 @@ where
             to: from,
             msg: Message::ReadIndexResponse(ReadIndexResponse {
                 term: self.current_term(),
+                request_id: request.request_id,
                 context: request.context,
             }),
         });
@@ -186,13 +263,24 @@ where
             || self.soft_state.role != Role::Leader
             || self.read_index_activation_term != Some(self.current_term())
             || !self.conf_state.is_voter(from)
+            || response.context.is_empty()
+            || response.context.len() > MAX_READ_INDEX_CONTEXT_BYTES
         {
             return;
         }
 
+        // A current-term response proves that this voter can still hear the
+        // leader. Count that contact for check-quorum just as append and
+        // snapshot responses are counted; otherwise a read-heavy leader could
+        // step down despite receiving a quorum-confirmed ReadIndex response.
+        self.mark_leader_peer_active(from);
+
         let current_term = self.current_term();
         for pending in &mut self.pending_read_indexes {
-            if pending.term == current_term && pending.context == response.context {
+            if pending.term == current_term
+                && pending.request_id == response.request_id
+                && pending.context == response.context
+            {
                 pending.acknowledgements.insert(from);
             }
         }
@@ -236,5 +324,37 @@ where
             .into_iter()
             .find(|entry| entry.index <= self.commit_index() && entry.term == term)
             .map(|entry| entry.index)
+    }
+
+    fn pending_read_index_count(&self) -> usize {
+        self.pending_read_indexes
+            .len()
+            .saturating_add(self.pending_read_states.len())
+            .saturating_add(
+                self.pending_ready
+                    .as_ref()
+                    .map_or(0, |ready| ready.read_states.len()),
+            )
+    }
+
+    fn pending_read_index_context_bytes(&self) -> usize {
+        let pending = self
+            .pending_read_indexes
+            .iter()
+            .map(|read| read.context.len())
+            .sum::<usize>();
+        let released = self
+            .pending_read_states
+            .iter()
+            .map(|read| read.request_ctx.len())
+            .sum::<usize>();
+        let ready = self.pending_ready.as_ref().map_or(0, |ready| {
+            ready
+                .read_states
+                .iter()
+                .map(|read| read.request_ctx.len())
+                .sum::<usize>()
+        });
+        pending.saturating_add(released).saturating_add(ready)
     }
 }

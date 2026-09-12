@@ -128,6 +128,13 @@ pub type NodeId = ReplicaId;
 pub type Term = u64;
 pub type LogIndex = u64;
 
+/// Exact proof that a committed configuration entry removed one replica.
+///
+/// The resulting configuration version is part of the proof because an
+/// index/term pair alone cannot reject a stale retirement after later
+/// membership changes.
+pub type RemovalProof = (ReplicaId, LogIndex, Term, u64);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Leader,
@@ -363,6 +370,9 @@ pub struct Snapshot<S> {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
     pub conf_state: ConfState,
+    /// Snapshot-carried evidence for the latest committed replica removal.
+    /// This survives log compaction and snapshot transfer.
+    pub last_removed_replica: Option<RemovalProof>,
     pub size_bytes: u64,
     pub checksum: [u8; 32],
     pub data: S,
@@ -380,6 +390,7 @@ impl<S> Snapshot<S> {
             last_included_index,
             last_included_term,
             conf_state,
+            last_removed_replica: None,
             size_bytes: std::mem::size_of_val(&data) as u64,
             checksum: [0; 32],
             data,
@@ -392,6 +403,7 @@ impl<S> Snapshot<S> {
             last_included_index: self.last_included_index,
             last_included_term: self.last_included_term,
             conf_state: self.conf_state.clone(),
+            last_removed_replica: self.last_removed_replica,
             size_bytes: self.size_bytes,
             checksum: self.checksum,
         }
@@ -405,6 +417,7 @@ pub struct SnapshotMetadata {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
     pub conf_state: ConfState,
+    pub last_removed_replica: Option<RemovalProof>,
     pub size_bytes: u64,
     pub checksum: [u8; 32],
 }

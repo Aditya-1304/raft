@@ -4,7 +4,10 @@ use raft::{
     message::{AppendEntriesRequest, Envelope, Message, PreVoteResponse, RequestVoteRequest},
     storage::mem::MemStorage,
     traits::{log_store::LogStore, stable_store::StableStore},
-    types::{ConfChange, ConfChangeError, ConfChangeKind, ConfState, ReplicaId, Role},
+    types::{
+        ConfChange, ConfChangeError, ConfChangeKind, ConfState, HardState, ReplicaId, Role,
+        Snapshot,
+    },
 };
 
 type TestStorage = MemStorage<(), ()>;
@@ -356,6 +359,78 @@ fn committed_configuration_entry_emits_and_persists_conf_state() {
     assert_eq!(emitted.version, 2);
     assert!(emitted.learners.contains(&ReplicaId::must(2)));
     assert_eq!(node.durable_conf_state(), Some(&emitted));
+}
+
+/// Realistic bug caught: after a crash, a committed removal must retain the
+/// exact log index, term, and resulting ConfState version needed by the
+/// metadata retirement proof. Reconstructing only the final voter set would
+/// make post-removal cleanup unable to prove which lifetime was removed.
+#[test]
+fn restart_retains_the_exact_committed_removal_proof() {
+    let committed = ConfState::new(3, [ReplicaId::must(1)], []).unwrap();
+    let mut stable = MemStorage::<(), ()>::new();
+    stable.set_conf_state(committed);
+    stable.set_hard_state(HardState {
+        current_term: 4,
+        voted_for: None,
+        commit: 7,
+    });
+
+    let mut log = MemStorage::<(), ()>::new();
+    let mut entries = (1..7)
+        .map(|index| LogEntry::normal(index, 4, ()))
+        .collect::<Vec<_>>();
+    entries.push(LogEntry {
+        index: 7,
+        term: 4,
+        encoded_len: 24,
+        payload: EntryPayload::Configuration(ConfChange {
+            expected_version: 2,
+            kind: ConfChangeKind::RemoveReplica(ReplicaId::must(2)),
+        }),
+    });
+    log.append(&entries);
+
+    let node = RaftNode::<(), (), TestStorage, TestStorage>::restart(
+        ReplicaId::must(1),
+        log,
+        stable,
+        5,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(
+        node.last_removed_replica(),
+        Some((ReplicaId::must(2), 7, 4, 3))
+    );
+}
+
+/// Realistic bug caught: once the removal entry is compacted, a snapshot
+/// restore must still expose the exact proof required before metadata cleanup.
+/// Without this assertion a transferred snapshot could silently erase the
+/// retirement boundary and allow an unsafe tombstone decision after restart.
+#[test]
+fn snapshot_retains_the_exact_committed_removal_proof_after_compaction() {
+    let conf_state = ConfState::new(3, [ReplicaId::must(1)], []).unwrap();
+    let mut node: TestNode = RaftNode::bootstrap(
+        ReplicaId::must(1),
+        conf_state.clone(),
+        MemStorage::new(),
+        MemStorage::new(),
+        5,
+        2,
+    )
+    .unwrap();
+
+    let mut snapshot = Snapshot::new(7, 4, conf_state, ());
+    snapshot.last_removed_replica = Some((ReplicaId::must(2), 7, 4, 3));
+    node.restore_snapshot(snapshot);
+
+    assert_eq!(
+        node.last_removed_replica(),
+        Some((ReplicaId::must(2), 7, 4, 3))
+    );
 }
 
 /// Realistic bug caught:

@@ -236,6 +236,10 @@ where
         let mut voters = None;
         let mut learners = None;
         let mut outgoing_voters = None;
+        let mut last_removed_replica_id = None;
+        let mut last_removed_replica_index = None;
+        let mut last_removed_replica_term = None;
+        let mut last_removed_conf_state_version = None;
         let mut data_hex = None;
 
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
@@ -259,6 +263,22 @@ where
                 "learners" => learners = Some(parse_replica_set("learners", value.trim())?),
                 "outgoing_voters" => {
                     outgoing_voters = Some(parse_replica_set("outgoing_voters", value.trim())?)
+                }
+                "last_removed_replica_id" => {
+                    last_removed_replica_id =
+                        Some(parse_u64("last_removed_replica_id", value.trim())?)
+                }
+                "last_removed_replica_index" => {
+                    last_removed_replica_index =
+                        Some(parse_u64("last_removed_replica_index", value.trim())?)
+                }
+                "last_removed_replica_term" => {
+                    last_removed_replica_term =
+                        Some(parse_u64("last_removed_replica_term", value.trim())?)
+                }
+                "last_removed_conf_state_version" => {
+                    last_removed_conf_state_version =
+                        Some(parse_u64("last_removed_conf_state_version", value.trim())?)
                 }
                 "size_bytes" => size_bytes = Some(parse_u64("size_bytes", value.trim())?),
                 "checksum" => checksum_hex = Some(value.trim().to_string()),
@@ -310,11 +330,48 @@ where
             )
         })?;
 
+        let removal_fields = [
+            last_removed_replica_id,
+            last_removed_replica_index,
+            last_removed_replica_term,
+            last_removed_conf_state_version,
+        ];
+        let all_fields_absent = removal_fields.iter().all(Option::is_none);
+        let all_fields_present = removal_fields.iter().all(Option::is_some);
+        let all_fields_zero = removal_fields.iter().all(|value| *value == Some(0));
+        let last_removed_replica = if all_fields_absent || (all_fields_present && all_fields_zero) {
+            None
+        } else if all_fields_present {
+            let replica_id = NodeId::new(removal_fields[0].expect("validated presence"))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot removal proof has zero replica ID",
+                    )
+                })?;
+            let index = removal_fields[1].expect("validated presence");
+            let term = removal_fields[2].expect("validated presence");
+            let version = removal_fields[3].expect("validated presence");
+            if index == 0 || term == 0 || version == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot removal proof contains a reserved zero field",
+                ));
+            }
+            Some((replica_id, index, term, version))
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot removal proof fields must be all present or all absent",
+            ));
+        };
+
         Ok(Some(Snapshot {
             snapshot_id: required_field(snapshot_id, "snapshot.snapshot_id")?,
             last_included_index,
             last_included_term,
             conf_state,
+            last_removed_replica,
             size_bytes: required_field(size_bytes, "snapshot.size_bytes")?,
             checksum,
             data,
@@ -327,7 +384,7 @@ where
         let data_hex = encode_hex(&data_bytes);
         let checksum_hex = encode_hex(&snapshot.checksum);
         let encoded = format!(
-            "snapshot_id={}\nlast_included_index={}\nlast_included_term={}\nconf_version={}\nvoters={}\nlearners={}\noutgoing_voters={}\nsize_bytes={}\nchecksum={}\ndata={}\n",
+            "snapshot_id={}\nlast_included_index={}\nlast_included_term={}\nconf_version={}\nvoters={}\nlearners={}\noutgoing_voters={}\nlast_removed_replica_id={}\nlast_removed_replica_index={}\nlast_removed_replica_term={}\nlast_removed_conf_state_version={}\nsize_bytes={}\nchecksum={}\ndata={}\n",
             snapshot.snapshot_id,
             snapshot.last_included_index,
             snapshot.last_included_term,
@@ -335,6 +392,22 @@ where
             encode_replica_set(&snapshot.conf_state.voters),
             encode_replica_set(&snapshot.conf_state.learners),
             encode_replica_set(&snapshot.conf_state.outgoing_voters),
+            snapshot
+                .last_removed_replica
+                .map(|proof| proof.0.get())
+                .unwrap_or(0),
+            snapshot
+                .last_removed_replica
+                .map(|proof| proof.1)
+                .unwrap_or(0),
+            snapshot
+                .last_removed_replica
+                .map(|proof| proof.2)
+                .unwrap_or(0),
+            snapshot
+                .last_removed_replica
+                .map(|proof| proof.3)
+                .unwrap_or(0),
             snapshot.size_bytes,
             checksum_hex,
             data_hex

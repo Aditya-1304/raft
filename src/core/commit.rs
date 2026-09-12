@@ -78,7 +78,12 @@ where
                     .conf_state
                     .apply(change)
                     .expect("committed configuration entry was not prevalidated");
+                if let crate::types::ConfChangeKind::RemoveReplica(replica_id) = change.kind {
+                    self.last_removed_replica =
+                        Some((replica_id, entry.index, entry.term, next.version));
+                }
                 self.install_conf_state(next);
+                self.last_applied_conf_change = Some((entry.index, entry.term));
             }
         }
 

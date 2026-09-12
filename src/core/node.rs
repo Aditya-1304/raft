@@ -8,8 +8,8 @@ use crate::{
     storage::mem::MemStorage,
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{
-        ConfChange, ConfChangeError, ConfState, ConfStateError, HardState, LeaderState, LogIndex,
-        NodeId, Role, Snapshot, SnapshotMetadata, SoftState, Term,
+        ConfChange, ConfChangeError, ConfChangeKind, ConfState, ConfStateError, HardState,
+        LeaderState, LogIndex, NodeId, Role, Snapshot, SnapshotMetadata, SoftState, Term,
     },
 };
 
@@ -146,6 +146,11 @@ where
 
     pub(crate) commit_index: LogIndex,
     pub(crate) last_applied: LogIndex,
+    /// Exact committed configuration entry most recently installed. Hosts use
+    /// this proof when publishing a metadata retirement record after removal.
+    pub(crate) last_applied_conf_change: Option<(LogIndex, Term)>,
+    /// Exact removal proof for the latest committed `RemoveReplica` entry.
+    pub(crate) last_removed_replica: Option<(NodeId, LogIndex, Term, u64)>,
 
     pub(crate) leader_state: Option<LeaderState>,
 
@@ -301,17 +306,45 @@ where
         election_timeout: u64,
         heartbeat_interval: u64,
     ) -> Result<Self, InitError> {
+        Self::restart_with_last_removed_replica(
+            id,
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+            None,
+        )
+    }
+
+    /// Restart with removal evidence retained by a compacted snapshot.
+    ///
+    /// The replayable log remains authoritative when it still contains a
+    /// committed removal. The supplied proof is only the fallback for the
+    /// compacted-prefix case, where the exact removal entry is no longer
+    /// available to the normal reconstruction scan.
+    pub fn restart_with_last_removed_replica(
+        id: NodeId,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+        snapshot_proof: Option<crate::types::RemovalProof>,
+    ) -> Result<Self, InitError> {
         let conf_state = stable
             .conf_state()
             .ok_or(InitError::MissingDurableConfiguration)?;
-        Self::from_conf_state(
+        let mut node = Self::from_conf_state(
             id,
             conf_state,
             log,
             stable,
             election_timeout,
             heartbeat_interval,
-        )
+        )?;
+        if node.last_removed_replica.is_none() {
+            node.last_removed_replica = snapshot_proof;
+        }
+        Ok(node)
     }
 
     /// Restarts a replica whose local identity has not yet been committed into
@@ -325,20 +358,43 @@ where
         election_timeout: u64,
         heartbeat_interval: u64,
     ) -> Result<Self, InitError> {
+        Self::restart_joining_with_last_removed_replica(
+            id,
+            log,
+            stable,
+            election_timeout,
+            heartbeat_interval,
+            None,
+        )
+    }
+
+    /// Joining-only restart variant with compacted-snapshot removal evidence.
+    pub fn restart_joining_with_last_removed_replica(
+        id: NodeId,
+        log: LS,
+        stable: SS,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+        snapshot_proof: Option<crate::types::RemovalProof>,
+    ) -> Result<Self, InitError> {
         let conf_state = stable
             .conf_state()
             .ok_or(InitError::MissingDurableConfiguration)?;
         if conf_state.contains(id) {
             return Err(InitError::JoiningReplicaAlreadyMember(id));
         }
-        Self::from_conf_state_allowing_joining(
+        let mut node = Self::from_conf_state_allowing_joining(
             id,
             conf_state,
             log,
             stable,
             election_timeout,
             heartbeat_interval,
-        )
+        )?;
+        if node.last_removed_replica.is_none() {
+            node.last_removed_replica = snapshot_proof;
+        }
+        Ok(node)
     }
 
     fn from_conf_state(
@@ -454,6 +510,26 @@ where
             .map(|entry| entry.encoded_len)
             .sum();
         let joining = allow_joining && !conf_state.contains(id);
+        let mut last_applied_conf_change = None;
+        let mut last_removed_replica = None;
+        for entry in logical_log.entries(first_index, usize::MAX) {
+            if entry.index > hard_state.commit {
+                break;
+            }
+            if let EntryPayload::Configuration(change) = &entry.payload {
+                last_applied_conf_change = Some((entry.index, entry.term));
+                if let ConfChangeKind::RemoveReplica(replica_id) = change.kind {
+                    let resulting_version = change.expected_version.checked_add(1).ok_or(
+                        InitError::InvalidPendingConfiguration {
+                            index: entry.index,
+                            error: ConfChangeError::VersionExhausted,
+                        },
+                    )?;
+                    last_removed_replica =
+                        Some((replica_id, entry.index, entry.term, resulting_version));
+                }
+            }
+        }
 
         Ok(Self {
             id,
@@ -470,6 +546,8 @@ where
             durable_log_index,
             commit_index: hard_state.commit,
             last_applied: 0,
+            last_applied_conf_change,
+            last_removed_replica,
             leader_state: None,
             election_elapsed: 0,
             election_timeout,
@@ -772,6 +850,7 @@ where
         }
 
         self.log.install_snapshot(snapshot_index, snapshot_term);
+        self.remember_removal_proof(snapshot.last_removed_replica);
         self.install_conf_state(snapshot.conf_state.clone());
         self.commit_to_snapshot(snapshot_index);
         self.committed.retain(|entry| entry.index > snapshot_index);
@@ -909,6 +988,17 @@ where
         self.last_applied
     }
 
+    /// Return the exact `(index, term)` of the latest committed configuration
+    /// entry known by this Raft core.
+    pub fn last_applied_conf_change(&self) -> Option<(LogIndex, Term)> {
+        self.last_applied_conf_change
+    }
+
+    /// Return the latest exact removal proof for a replica identity.
+    pub fn last_removed_replica(&self) -> Option<(NodeId, LogIndex, Term, u64)> {
+        self.last_removed_replica
+    }
+
     pub fn has_ready(&self) -> bool {
         self.recovery_required_ready_id.is_none()
             && (self.pending_ready.is_some() || self.has_staged_ready())
@@ -1026,6 +1116,7 @@ where
         }
 
         self.log.install_snapshot(snapshot_index, snapshot_term);
+        self.remember_removal_proof(snapshot.last_removed_replica);
         self.install_conf_state(snapshot.conf_state.clone());
         self.commit_to_snapshot(snapshot_index);
         self.pending_entries.clear();
@@ -1074,6 +1165,17 @@ where
 
         if !self.conf_state.is_voter(self.id) && self.soft_state.role != Role::Follower {
             self.become_follower(self.current_term(), None);
+        }
+    }
+
+    fn remember_removal_proof(&mut self, candidate: Option<crate::types::RemovalProof>) {
+        let should_replace = match (self.last_removed_replica, candidate) {
+            (None, Some(_)) => true,
+            (Some(current), Some(candidate)) => candidate.1 > current.1,
+            (_, None) => false,
+        };
+        if should_replace {
+            self.last_removed_replica = candidate;
         }
     }
 

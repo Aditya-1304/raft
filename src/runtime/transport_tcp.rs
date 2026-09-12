@@ -513,6 +513,7 @@ where
         push_u64(buf, request.metadata.last_included_index);
         push_u64(buf, request.metadata.last_included_term);
         encode_conf_state(buf, &request.metadata.conf_state);
+        encode_removal_proof(buf, request.metadata.last_removed_replica);
         push_u64(buf, request.metadata.size_bytes);
         buf.extend_from_slice(&request.metadata.checksum);
         Ok(())
@@ -528,6 +529,7 @@ where
         let last_included_index = read_u64(cursor)?;
         let last_included_term = read_u64(cursor)?;
         let conf_state = decode_conf_state(cursor)?;
+        let last_removed_replica = decode_removal_proof(cursor)?;
         let size_bytes = read_u64(cursor)?;
         let mut checksum = [0_u8; 32];
         cursor.read_exact(&mut checksum)?;
@@ -540,6 +542,7 @@ where
                 last_included_index,
                 last_included_term,
                 conf_state,
+                last_removed_replica,
                 size_bytes,
                 checksum,
             },
@@ -738,6 +741,19 @@ fn encode_conf_state(buf: &mut Vec<u8>, conf_state: &ConfState) {
     encode_replica_set(buf, &conf_state.outgoing_voters);
 }
 
+fn encode_removal_proof(buf: &mut Vec<u8>, proof: Option<crate::types::RemovalProof>) {
+    match proof {
+        Some((replica_id, index, term, version)) => {
+            push_u8(buf, 1);
+            push_u64(buf, replica_id.get());
+            push_u64(buf, index);
+            push_u64(buf, term);
+            push_u64(buf, version);
+        }
+        None => push_u8(buf, 0),
+    }
+}
+
 fn encode_conf_change(buf: &mut Vec<u8>, change: &ConfChange) {
     push_u64(buf, change.expected_version);
     let (tag, replica_id) = match change.kind {
@@ -838,6 +854,36 @@ fn decode_conf_state(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfState> {
         )
     })?;
     Ok(conf_state)
+}
+
+fn decode_removal_proof(
+    cursor: &mut Cursor<&[u8]>,
+) -> io::Result<Option<crate::types::RemovalProof>> {
+    match read_u8(cursor)? {
+        0 => Ok(None),
+        1 => {
+            let replica_id = crate::types::NodeId::new(read_u64(cursor)?).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot removal proof has zero replica ID",
+                )
+            })?;
+            let index = read_u64(cursor)?;
+            let term = read_u64(cursor)?;
+            let version = read_u64(cursor)?;
+            if index == 0 || term == 0 || version == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot removal proof contains a reserved zero field",
+                ));
+            }
+            Ok(Some((replica_id, index, term, version)))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid removal proof tag: {other}"),
+        )),
+    }
 }
 
 fn decode_conf_change(cursor: &mut Cursor<&[u8]>) -> io::Result<ConfChange> {

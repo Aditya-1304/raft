@@ -1,6 +1,6 @@
 use raft::{
     core::read_index::MAX_READ_INDEX_CONTEXT_BYTES,
-    message::{Envelope, Message, ReadIndexRequest, ReadIndexResponse},
+    message::{Envelope, Message, ReadIndexRequest, ReadIndexResponse, TimeoutNowRequest},
     runtime::transport_tcp::TcpEnvelopeCodec,
     storage::codec::UnitCodec,
     types::NodeId,
@@ -72,6 +72,33 @@ fn truncated_read_index_frame_is_rejected() {
         codec
             .decode_envelope(&encoded[..encoded.len() - 1])
             .is_err()
+    );
+}
+
+#[test]
+/// Catches a transfer wire-format mismatch that could deliver the request to
+/// the right voter while losing the term, transfer identity, or log frontier
+/// used to reject stale and incomplete handoffs.
+fn timeout_now_request_round_trips_through_tcp_codec() {
+    let codec = codec();
+    let request = Envelope {
+        from: NodeId::must(1),
+        to: NodeId::must(2),
+        msg: Message::TimeoutNow(TimeoutNowRequest {
+            term: 9,
+            leader_id: NodeId::must(1),
+            target_id: NodeId::must(2),
+            transfer_id: 17,
+            last_log_index: 42,
+            last_log_term: 8,
+        }),
+    };
+
+    assert_eq!(
+        codec
+            .decode_envelope(&codec.encode_envelope(&request).unwrap())
+            .unwrap(),
+        request
     );
 }
 

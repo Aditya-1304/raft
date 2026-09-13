@@ -697,6 +697,7 @@ fn handle_admin_request(
                     Err(
                         ProposeError::RecoveryRequired
                         | ProposeError::NotLeader
+                        | ProposeError::LeadershipTransferInProgress { .. }
                         | ProposeError::ConfigurationChangePending
                         | ProposeError::InvalidConfiguration(_)
                         | ProposeError::LearnerNotCaughtUp { .. }

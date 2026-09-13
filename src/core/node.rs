@@ -4,12 +4,13 @@ use crate::{
     core::read_index::PendingReadIndex,
     core::ready::{AdvanceError, Ready, ReadyId},
     entry::{EntryPayload, LogEntry},
-    message::Envelope,
+    message::{Envelope, TimeoutNowRequest},
     storage::mem::MemStorage,
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{
         ConfChange, ConfChangeError, ConfChangeKind, ConfState, ConfStateError, HardState,
-        LeaderState, LogIndex, NodeId, Role, Snapshot, SnapshotMetadata, SoftState, Term,
+        LeaderState, LogIndex, NodeId, ProgressMode, Role, Snapshot, SnapshotMetadata, SoftState,
+        Term,
     },
 };
 
@@ -17,6 +18,10 @@ use crate::{
 pub enum ProposeError {
     RecoveryRequired,
     NotLeader,
+    LeadershipTransferInProgress {
+        target: NodeId,
+        term: Term,
+    },
     ConfigurationChangePending,
     InvalidConfiguration(ConfChangeError),
     LearnerNotCaughtUp {
@@ -41,6 +46,61 @@ pub enum ProposeError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadershipTransferError {
+    RecoveryRequired,
+    NotLeader,
+    TimeoutZero,
+    TargetIsSelf(NodeId),
+    UnknownTarget(NodeId),
+    TargetIsLearner(NodeId),
+    JointConsensusInProgress,
+    ConfigurationChangePending,
+    TransferInProgress {
+        target: NodeId,
+        term: Term,
+    },
+    TargetProgressUnavailable(NodeId),
+    TargetNotCaughtUp {
+        target: NodeId,
+        match_index: LogIndex,
+        leader_last_index: LogIndex,
+    },
+    TransferIdExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadershipTransferStatus {
+    pub target: NodeId,
+    pub term: Term,
+    pub transfer_id: u64,
+    pub elapsed_ticks: u64,
+    pub timeout_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeadershipTransferState {
+    target: NodeId,
+    term: Term,
+    conf_state_version: u64,
+    transfer_id: u64,
+    elapsed_ticks: u64,
+    timeout_ticks: u64,
+    timeout_now_sent: bool,
+}
+
+impl LeadershipTransferState {
+    fn status(self) -> LeadershipTransferStatus {
+        LeadershipTransferStatus {
+            target: self.target,
+            term: self.term,
+            transfer_id: self.transfer_id,
+            elapsed_ticks: self.elapsed_ticks,
+            timeout_ticks: self.timeout_ticks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaftError {
     RecoveryRequired,
     TermExhausted,
@@ -52,6 +112,7 @@ pub enum StepError {
     WrongDestination { expected: NodeId, actual: NodeId },
     UnknownReplica(NodeId),
     PayloadIdentityMismatch { envelope: NodeId, payload: NodeId },
+    PayloadTargetMismatch { expected: NodeId, actual: NodeId },
     IndexOverflow,
     InvalidSnapshotConfiguration(ConfStateError),
     InvalidConfigurationTransition(ConfChangeError),
@@ -171,6 +232,15 @@ where
     pub(crate) pending_read_indexes: Vec<PendingReadIndex>,
     pub(crate) read_index_activation_term: Option<Term>,
     pub(crate) next_read_index_id: u64,
+    /// Volatile handoff state. Transfer intent is not a membership or data
+    /// record; a restart must return to ordinary election behavior instead of
+    /// replaying an obsolete administrative request.
+    pub(crate) leadership_transfer: Option<LeadershipTransferState>,
+    pub(crate) next_transfer_id: u64,
+    /// Highest targeted transfer request observed from a leader in the
+    /// current term. This suppresses duplicate or reordered TimeoutNow
+    /// packets without making the transfer intent durable.
+    pub(crate) last_timeout_now: Option<(Term, NodeId, u64)>,
 
     pub(crate) pending_hard_state: Option<HardState>,
     pub(crate) pending_conf_state: Option<ConfState>,
@@ -564,6 +634,9 @@ where
             pending_read_indexes: Vec::new(),
             read_index_activation_term: None,
             next_read_index_id: 1,
+            leadership_transfer: None,
+            next_transfer_id: 1,
+            last_timeout_now: None,
             pending_hard_state: None,
             pending_conf_state: None,
             pending_entries: Vec::new(),
@@ -588,6 +661,163 @@ where
         self.propose_with_size(cmd, encoded_len)
     }
 
+    /// Starts a bounded transfer of leadership to one caught-up voter.
+    ///
+    /// Transfer intent is deliberately volatile. The current leader remains
+    /// in charge until the target wins an election, but no new application or
+    /// configuration proposal is admitted while the attempt is active. This
+    /// prevents a planned removal or shutdown from racing a final write into
+    /// the leader that is about to hand off authority.
+    pub fn transfer_leadership(
+        &mut self,
+        target: NodeId,
+        timeout_ticks: u64,
+    ) -> Result<LeadershipTransferStatus, LeadershipTransferError> {
+        if self.recovery_required_ready_id.is_some() {
+            return Err(LeadershipTransferError::RecoveryRequired);
+        }
+        if self.soft_state.role != Role::Leader {
+            return Err(LeadershipTransferError::NotLeader);
+        }
+        if timeout_ticks == 0 {
+            return Err(LeadershipTransferError::TimeoutZero);
+        }
+
+        if let Some(transfer) = self.leadership_transfer {
+            if transfer.term == self.current_term() && transfer.target == target {
+                return Ok(transfer.status());
+            }
+            return Err(LeadershipTransferError::TransferInProgress {
+                target: transfer.target,
+                term: transfer.term,
+            });
+        }
+
+        if target == self.id {
+            return Err(LeadershipTransferError::TargetIsSelf(target));
+        }
+        if !self.conf_state.outgoing_voters.is_empty() {
+            return Err(LeadershipTransferError::JointConsensusInProgress);
+        }
+        if !self.conf_state.contains(target) {
+            return Err(LeadershipTransferError::UnknownTarget(target));
+        }
+        if !self.conf_state.is_voter(target) {
+            return Err(LeadershipTransferError::TargetIsLearner(target));
+        }
+        if self.pending_conf_change_index.is_some() {
+            return Err(LeadershipTransferError::ConfigurationChangePending);
+        }
+
+        let Some(progress) = self
+            .leader_state
+            .as_ref()
+            .and_then(|leader| leader.progress.get(&target))
+        else {
+            return Err(LeadershipTransferError::TargetProgressUnavailable(target));
+        };
+        let leader_last_index = self.last_log_index();
+        if progress.mode == ProgressMode::Snapshot || progress.match_index < leader_last_index {
+            return Err(LeadershipTransferError::TargetNotCaughtUp {
+                target,
+                match_index: progress.match_index,
+                leader_last_index,
+            });
+        }
+
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(LeadershipTransferError::TransferIdExhausted)?;
+        let transfer = LeadershipTransferState {
+            target,
+            term: self.current_term(),
+            conf_state_version: self.conf_state.version,
+            transfer_id,
+            elapsed_ticks: 0,
+            timeout_ticks,
+            timeout_now_sent: false,
+        };
+        self.leadership_transfer = Some(transfer);
+        self.maybe_send_timeout_now();
+        Ok(transfer.status())
+    }
+
+    /// Returns the active transfer, if this node is still the transferring
+    /// leader. Callers use this only for status and retry coordination; the
+    /// Raft core remains the authority for completion and cancellation.
+    pub fn leadership_transfer(&self) -> Option<LeadershipTransferStatus> {
+        self.leadership_transfer
+            .map(LeadershipTransferState::status)
+    }
+
+    pub(crate) fn advance_leadership_transfer(&mut self, ticks: u64) {
+        let current_term = self.current_term();
+        let conf_state_version = self.conf_state.version;
+        let is_leader = self.soft_state.role == Role::Leader;
+        let target_is_voter = self
+            .leadership_transfer
+            .is_some_and(|transfer| self.conf_state.is_voter(transfer.target));
+        let Some(transfer) = self.leadership_transfer.as_mut() else {
+            return;
+        };
+
+        transfer.elapsed_ticks = transfer.elapsed_ticks.saturating_add(ticks);
+        if transfer.elapsed_ticks >= transfer.timeout_ticks
+            || transfer.term != current_term
+            || transfer.conf_state_version != conf_state_version
+            || !is_leader
+            || !target_is_voter
+        {
+            self.leadership_transfer = None;
+            return;
+        }
+
+        self.maybe_send_timeout_now();
+    }
+
+    pub(crate) fn maybe_send_timeout_now(&mut self) {
+        let Some(transfer) = self.leadership_transfer else {
+            return;
+        };
+        if transfer.timeout_now_sent
+            || self.soft_state.role != Role::Leader
+            || transfer.term != self.current_term()
+            || transfer.conf_state_version != self.conf_state.version
+            || !self.conf_state.is_voter(transfer.target)
+        {
+            return;
+        }
+
+        let Some(progress) = self
+            .leader_state
+            .as_ref()
+            .and_then(|leader| leader.progress.get(&transfer.target))
+        else {
+            return;
+        };
+        if progress.mode == ProgressMode::Snapshot || progress.match_index < self.last_log_index() {
+            return;
+        }
+
+        self.outbox.push(Envelope {
+            from: self.id,
+            to: transfer.target,
+            msg: crate::message::Message::TimeoutNow(TimeoutNowRequest {
+                term: transfer.term,
+                leader_id: self.id,
+                target_id: transfer.target,
+                transfer_id: transfer.transfer_id,
+                last_log_index: self.last_log_index(),
+                last_log_term: self.last_log_term(),
+            }),
+        });
+        if let Some(active) = self.leadership_transfer.as_mut() {
+            active.timeout_now_sent = true;
+        }
+    }
+
     /// Proposes an application command using its host-computed encoded size.
     pub fn propose_with_size(
         &mut self,
@@ -599,6 +829,12 @@ where
         }
         if self.soft_state.role != Role::Leader {
             return Err(ProposeError::NotLeader);
+        }
+        if let Some(transfer) = self.leadership_transfer {
+            return Err(ProposeError::LeadershipTransferInProgress {
+                target: transfer.target,
+                term: transfer.term,
+            });
         }
         self.admit_proposal(encoded_len)?;
 
@@ -633,6 +869,12 @@ where
         }
         if self.soft_state.role != Role::Leader {
             return Err(ProposeError::NotLeader);
+        }
+        if let Some(transfer) = self.leadership_transfer {
+            return Err(ProposeError::LeadershipTransferInProgress {
+                target: transfer.target,
+                term: transfer.term,
+            });
         }
         if self.pending_conf_change_index.is_some() {
             return Err(ProposeError::ConfigurationChangePending);
@@ -1139,6 +1381,12 @@ where
 
     pub(crate) fn install_conf_state(&mut self, conf_state: ConfState) {
         debug_assert!(conf_state.validate().is_ok());
+        if self
+            .leadership_transfer
+            .is_some_and(|transfer| transfer.conf_state_version != conf_state.version)
+        {
+            self.leadership_transfer = None;
+        }
         if self.joining {
             self.joining = !conf_state.contains(self.id);
         }

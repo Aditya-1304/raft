@@ -14,7 +14,7 @@ use crate::{
     message::{
         AppendEntriesRequest, AppendEntriesResponse, Envelope, InstallSnapshotRequest,
         InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, ReadIndexRequest,
-        ReadIndexResponse, RequestVoteRequest, RequestVoteResponse,
+        ReadIndexResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
     },
     storage::codec::{CommandCodec, SnapshotCodec},
     traits::transport::Transport,
@@ -31,6 +31,7 @@ const TAG_INSTALL_SNAPSHOT_REQUEST: u8 = 7;
 const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
 const TAG_READ_INDEX_REQUEST: u8 = 9;
 const TAG_READ_INDEX_RESPONSE: u8 = 10;
+const TAG_TIMEOUT_NOW: u8 = 11;
 const MAX_WIRE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_APPEND_ENTRIES: usize = 4_096;
 
@@ -278,6 +279,10 @@ where
                 push_u8(&mut buf, TAG_READ_INDEX_RESPONSE);
                 self.encode_read_index_response(&mut buf, response);
             }
+            Message::TimeoutNow(request) => {
+                push_u8(&mut buf, TAG_TIMEOUT_NOW);
+                self.encode_timeout_now_request(&mut buf, request);
+            }
         }
 
         Ok(buf)
@@ -319,6 +324,7 @@ where
             TAG_READ_INDEX_RESPONSE => {
                 Message::ReadIndexResponse(self.decode_read_index_response(&mut cursor)?)
             }
+            TAG_TIMEOUT_NOW => Message::TimeoutNow(self.decode_timeout_now_request(&mut cursor)?),
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -603,6 +609,29 @@ where
             term: read_u64(cursor)?,
             request_id: read_u64(cursor)?,
             context: read_bytes_limited(cursor, MAX_READ_INDEX_CONTEXT_BYTES, "ReadIndex context")?,
+        })
+    }
+
+    fn encode_timeout_now_request(&self, buf: &mut Vec<u8>, request: &TimeoutNowRequest) {
+        push_u64(buf, request.term);
+        push_u64(buf, request.leader_id);
+        push_u64(buf, request.target_id);
+        push_u64(buf, request.transfer_id);
+        push_u64(buf, request.last_log_index);
+        push_u64(buf, request.last_log_term);
+    }
+
+    fn decode_timeout_now_request(
+        &self,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> io::Result<TimeoutNowRequest> {
+        Ok(TimeoutNowRequest {
+            term: read_u64(cursor)?,
+            leader_id: read_replica_id(cursor)?,
+            target_id: read_replica_id(cursor)?,
+            transfer_id: read_u64(cursor)?,
+            last_log_index: read_u64(cursor)?,
+            last_log_term: read_u64(cursor)?,
         })
     }
 }

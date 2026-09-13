@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::{
     message::{
-        Envelope, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse,
+        Envelope, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
+        RequestVoteResponse, TimeoutNowRequest,
     },
     traits::{log_store::LogStore, stable_store::StableStore},
     types::{LeaderState, NodeId, Progress, Role},
@@ -29,6 +30,8 @@ where
             Role::Leader => {
                 self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(ticks);
                 self.election_elapsed = self.election_elapsed.saturating_add(ticks);
+
+                self.advance_leadership_transfer(ticks);
 
                 if self.maybe_step_down_on_quorum_loss() {
                     return Ok(());
@@ -117,6 +120,18 @@ where
                     payload: request.leader_id,
                 });
             }
+            Message::TimeoutNow(request) if request.leader_id != envelope.from => {
+                return Err(StepError::PayloadIdentityMismatch {
+                    envelope: envelope.from,
+                    payload: request.leader_id,
+                });
+            }
+            Message::TimeoutNow(request) if request.target_id != self.id => {
+                return Err(StepError::PayloadTargetMismatch {
+                    expected: self.id,
+                    actual: request.target_id,
+                });
+            }
             _ => {}
         }
 
@@ -162,8 +177,34 @@ where
             Message::ReadIndexResponse(response) => {
                 self.handle_read_index_response_from(from, response);
             }
+            Message::TimeoutNow(request) => {
+                self.handle_timeout_now_request(from, request);
+            }
         }
         Ok(())
+    }
+
+    fn handle_timeout_now_request(&mut self, from: NodeId, request: TimeoutNowRequest) {
+        if !self.conf_state.outgoing_voters.is_empty()
+            || !self.conf_state.is_voter(self.id)
+            || !self.conf_state.is_voter(from)
+            || request.term != self.current_term()
+            || self.soft_state.leader_id != Some(from)
+            || self.last_log_index() != request.last_log_index
+            || self.last_log_term() != request.last_log_term
+        {
+            return;
+        }
+
+        if let Some((term, leader_id, transfer_id)) = self.last_timeout_now
+            && (term, leader_id) == (request.term, from)
+            && request.transfer_id <= transfer_id
+        {
+            return;
+        }
+
+        self.last_timeout_now = Some((request.term, from, request.transfer_id));
+        self.start_prevote();
     }
 
     fn start_prevote(&mut self) {

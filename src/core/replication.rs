@@ -212,6 +212,7 @@ where
         if should_send_more {
             self.send_append_entries_to(from);
         }
+        self.maybe_send_timeout_now();
     }
 
     pub(crate) fn handle_install_snapshot_request(

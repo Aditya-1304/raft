@@ -95,6 +95,23 @@ pub struct ReadIndexResponse {
     pub context: Vec<u8>,
 }
 
+/// Requests a specific voter to begin an immediate election as part of a
+/// leadership-transfer attempt.
+///
+/// The request is deliberately not a log entry. The current leader remains
+/// authoritative until the target wins a normal election, while the term and
+/// log frontier prevent a delayed request from promoting an obsolete or
+/// incomplete replica.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutNowRequest {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub target_id: NodeId,
+    pub transfer_id: u64,
+    pub last_log_index: LogIndex,
+    pub last_log_term: Term,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message<C, S> {
     PreVote(PreVoteRequest),
@@ -107,6 +124,7 @@ pub enum Message<C, S> {
     InstallSnapshotResponse(InstallSnapshotResponse),
     ReadIndex(ReadIndexRequest),
     ReadIndexResponse(ReadIndexResponse),
+    TimeoutNow(TimeoutNowRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

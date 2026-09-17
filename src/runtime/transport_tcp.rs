@@ -405,6 +405,7 @@ where
     ) -> io::Result<()> {
         push_u64(buf, request.term);
         push_u64(buf, request.leader_id);
+        push_u64(buf, request.generation);
         push_u64(buf, request.prev_log_index);
         push_u64(buf, request.prev_log_term);
         push_u64(buf, request.leader_commit);
@@ -434,6 +435,7 @@ where
     ) -> io::Result<AppendEntriesRequest<C>> {
         let term = read_u64(cursor)?;
         let leader_id = read_replica_id(cursor)?;
+        let generation = read_u64(cursor)?;
         let prev_log_index = read_u64(cursor)?;
         let prev_log_term = read_u64(cursor)?;
         let leader_commit = read_u64(cursor)?;
@@ -480,6 +482,7 @@ where
         Ok(AppendEntriesRequest {
             term,
             leader_id,
+            generation,
             prev_log_index,
             prev_log_term,
             entries,
@@ -489,6 +492,7 @@ where
 
     fn encode_append_entries_response(&self, buf: &mut Vec<u8>, response: &AppendEntriesResponse) {
         push_u64(buf, response.term);
+        push_u64(buf, response.generation);
         push_bool(buf, response.success);
         push_option_u64(buf, response.match_index);
         push_option_u64(buf, response.conflict_term);
@@ -501,6 +505,7 @@ where
     ) -> io::Result<AppendEntriesResponse> {
         Ok(AppendEntriesResponse {
             term: read_u64(cursor)?,
+            generation: read_u64(cursor)?,
             success: read_bool(cursor)?,
             match_index: read_option_u64(cursor)?,
             conflict_term: read_option_u64(cursor)?,
@@ -515,6 +520,7 @@ where
     ) -> io::Result<()> {
         push_u64(buf, request.term);
         push_u64(buf, request.leader_id);
+        push_u64(buf, request.generation);
         push_u64(buf, request.metadata.snapshot_id);
         push_u64(buf, request.metadata.last_included_index);
         push_u64(buf, request.metadata.last_included_term);
@@ -531,6 +537,7 @@ where
     ) -> io::Result<InstallSnapshotRequest<S>> {
         let term = read_u64(cursor)?;
         let leader_id = read_replica_id(cursor)?;
+        let generation = read_u64(cursor)?;
         let snapshot_id = read_u64(cursor)?;
         let last_included_index = read_u64(cursor)?;
         let last_included_term = read_u64(cursor)?;
@@ -540,7 +547,7 @@ where
         let mut checksum = [0_u8; 32];
         cursor.read_exact(&mut checksum)?;
 
-        Ok(InstallSnapshotRequest::new(
+        Ok(InstallSnapshotRequest::new_with_generation(
             term,
             leader_id,
             crate::types::SnapshotMetadata {
@@ -552,6 +559,7 @@ where
                 size_bytes,
                 checksum,
             },
+            generation,
         ))
     }
 
@@ -561,6 +569,7 @@ where
         response: &InstallSnapshotResponse,
     ) {
         push_u64(buf, response.term);
+        push_u64(buf, response.generation);
         push_bool(buf, response.success);
         push_u64(buf, response.last_included_index);
     }
@@ -571,6 +580,7 @@ where
     ) -> io::Result<InstallSnapshotResponse> {
         Ok(InstallSnapshotResponse {
             term: read_u64(cursor)?,
+            generation: read_u64(cursor)?,
             success: read_bool(cursor)?,
             last_included_index: read_u64(cursor)?,
         })

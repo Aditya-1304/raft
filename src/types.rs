@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     num::ParseIntError,
     str::FromStr,
@@ -165,10 +165,22 @@ impl Default for SoftState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InflightAppend {
+    pub generation: u64,
+    pub start_index: LogIndex,
+    pub end_index: LogIndex,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
     pub next_index: LogIndex,
     pub match_index: LogIndex,
     pub mode: ProgressMode,
+    /// Monotonically increasing fence for messages belonging to this
+    /// follower's current replication window.
+    pub generation: u64,
+    pub inflight: VecDeque<InflightAppend>,
     pub inflight_batches: usize,
     pub inflight_bytes: usize,
 }
@@ -179,8 +191,47 @@ impl Progress {
             next_index,
             match_index: 0,
             mode: ProgressMode::Probe,
+            generation: 0,
+            inflight: VecDeque::new(),
             inflight_batches: 0,
             inflight_bytes: 0,
+        }
+    }
+
+    pub fn clear_inflight(&mut self) {
+        self.inflight.clear();
+        self.inflight_batches = 0;
+        self.inflight_bytes = 0;
+    }
+
+    pub fn begin_new_generation(&mut self) {
+        self.clear_inflight();
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("replication progress generation exhausted");
+    }
+
+    pub fn record_inflight(&mut self, batch: InflightAppend) {
+        debug_assert_eq!(batch.generation, self.generation);
+        debug_assert!(batch.start_index <= batch.end_index);
+        self.inflight_batches = self.inflight_batches.saturating_add(1);
+        self.inflight_bytes = self.inflight_bytes.saturating_add(batch.bytes);
+        self.inflight.push_back(batch);
+    }
+
+    pub fn acknowledge_through(&mut self, acknowledged: LogIndex) {
+        while self
+            .inflight
+            .front()
+            .is_some_and(|batch| batch.end_index <= acknowledged)
+        {
+            let batch = self
+                .inflight
+                .pop_front()
+                .expect("inflight front disappeared during acknowledgment");
+            self.inflight_batches = self.inflight_batches.saturating_sub(1);
+            self.inflight_bytes = self.inflight_bytes.saturating_sub(batch.bytes);
         }
     }
 }

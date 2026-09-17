@@ -459,6 +459,7 @@ fn follower_rejects_invalid_configuration_before_append_or_commit() {
         msg: Message::AppendEntries(AppendEntriesRequest {
             term: 1,
             leader_id: ReplicaId::must(2),
+            generation: 0,
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![LogEntry {

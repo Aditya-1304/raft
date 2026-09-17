@@ -150,3 +150,228 @@ fn catch_up_batches_respect_entry_limits_and_progress_modes() {
         ProgressMode::Replicate
     );
 }
+
+#[test]
+fn replicate_mode_fills_the_bounded_window_with_distinct_ranges() {
+    let mut log = MemStorage::new();
+    log.append(&[
+        LogEntry::normal(1, 1, 10),
+        LogEntry::normal(2, 1, 20),
+        LogEntry::normal(3, 1, 30),
+        LogEntry::normal(4, 1, 40),
+        LogEntry::normal(5, 1, 50),
+    ]);
+    let mut stable = MemStorage::new();
+    stable.set_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: 0,
+    });
+    let mut leader = RaftNode::new(1, vec![2, 3], log, stable, 5, 2);
+    leader.set_limits(RaftLimits {
+        max_append_entries: 1,
+        max_inflight_append_batches: 3,
+        max_inflight_append_bytes: 1_000,
+        ..RaftLimits::default()
+    });
+    let mut follower = RaftNode::new(2, vec![1, 3], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    let heartbeat = elect_with_one_follower(&mut leader, &mut follower)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(heartbeat);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+
+    let first_batch = take_messages(&mut leader)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(first_batch);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+
+    let pipelined = take_messages(&mut leader)
+        .into_iter()
+        .filter_map(|message| match message.msg {
+            Message::AppendEntries(request) if message.to.get() == 2 => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(pipelined.len(), 3);
+    assert_eq!(
+        pipelined
+            .iter()
+            .map(|request| (request.prev_log_index + 1, request.entries[0].index))
+            .collect::<Vec<_>>(),
+        vec![(2, 2), (3, 3), (4, 4)]
+    );
+    assert_eq!(
+        leader
+            .progress(raft::types::ReplicaId::must(2))
+            .unwrap()
+            .inflight_batches,
+        3
+    );
+}
+
+#[test]
+fn partial_ack_releases_only_ranges_proven_by_match_index() {
+    let mut log = MemStorage::new();
+    log.append(&[
+        LogEntry::normal(1, 1, 10),
+        LogEntry::normal(2, 1, 20),
+        LogEntry::normal(3, 1, 30),
+        LogEntry::normal(4, 1, 40),
+    ]);
+    let mut stable = MemStorage::new();
+    stable.set_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: 0,
+    });
+    let mut leader = RaftNode::new(1, vec![2, 3], log, stable, 5, 2);
+    leader.set_limits(RaftLimits {
+        max_append_entries: 1,
+        max_inflight_append_batches: 3,
+        max_inflight_append_bytes: 1_000,
+        ..RaftLimits::default()
+    });
+    let mut follower = RaftNode::new(2, vec![1, 3], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    let heartbeat = elect_with_one_follower(&mut leader, &mut follower)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(heartbeat);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+
+    let first_batch = take_messages(&mut leader)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(first_batch);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+    let _ = take_messages(&mut leader);
+
+    let progress = leader.progress(raft::types::ReplicaId::must(2)).unwrap();
+    assert_eq!(
+        progress
+            .inflight
+            .iter()
+            .map(|batch| batch.end_index)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    let generation = progress.generation;
+
+    leader.step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::AppendEntriesResponse(raft::message::AppendEntriesResponse {
+            term: leader.current_term(),
+            generation,
+            success: true,
+            match_index: Some(2),
+            conflict_term: None,
+            conflict_index: None,
+        }),
+    });
+
+    let progress = leader.progress(raft::types::ReplicaId::must(2)).unwrap();
+    assert_eq!(
+        progress
+            .inflight
+            .iter()
+            .map(|batch| batch.end_index)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert_eq!(progress.inflight_batches, 2);
+    assert_eq!(
+        progress.inflight_bytes,
+        progress.inflight.iter().map(|batch| batch.bytes).sum()
+    );
+}
+
+#[test]
+fn stale_generation_response_cannot_release_a_rewound_window() {
+    let mut log = MemStorage::new();
+    log.append(&[
+        LogEntry::normal(1, 1, 10),
+        LogEntry::normal(2, 1, 20),
+        LogEntry::normal(3, 1, 30),
+    ]);
+    let mut stable = MemStorage::new();
+    stable.set_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: 0,
+    });
+    let mut leader = RaftNode::new(1, vec![2, 3], log, stable, 5, 2);
+    leader.set_limits(RaftLimits {
+        max_append_entries: 1,
+        max_inflight_append_batches: 2,
+        max_inflight_append_bytes: 1_000,
+        ..RaftLimits::default()
+    });
+    let mut follower = RaftNode::new(2, vec![1, 3], MemStorage::new(), MemStorage::new(), 5, 2);
+
+    let heartbeat = elect_with_one_follower(&mut leader, &mut follower)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(heartbeat);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+    let first_batch = take_messages(&mut leader)
+        .into_iter()
+        .find(|message| message.to.get() == 2)
+        .unwrap();
+    follower.step(first_batch);
+    leader.step(take_messages(&mut follower).pop().unwrap());
+    let _ = take_messages(&mut leader);
+
+    let old_generation = leader
+        .progress(raft::types::ReplicaId::must(2))
+        .unwrap()
+        .generation;
+    leader.step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::AppendEntriesResponse(raft::message::AppendEntriesResponse {
+            term: leader.current_term(),
+            generation: old_generation,
+            success: false,
+            match_index: None,
+            conflict_term: None,
+            conflict_index: Some(1),
+        }),
+    });
+    let _ = take_messages(&mut leader);
+
+    let progress = leader
+        .progress(raft::types::ReplicaId::must(2))
+        .unwrap()
+        .clone();
+    assert!(progress.generation > old_generation);
+    assert_eq!(progress.mode, ProgressMode::Probe);
+    assert_eq!(progress.inflight_batches, 1);
+
+    leader.step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::AppendEntriesResponse(raft::message::AppendEntriesResponse {
+            term: leader.current_term(),
+            generation: old_generation,
+            success: true,
+            match_index: Some(3),
+            conflict_term: None,
+            conflict_index: None,
+        }),
+    });
+
+    let progress_after_stale = leader.progress(raft::types::ReplicaId::must(2)).unwrap();
+    assert_eq!(progress_after_stale.generation, progress.generation);
+    assert_eq!(progress_after_stale.mode, ProgressMode::Probe);
+    assert_eq!(progress_after_stale.inflight_batches, 1);
+}

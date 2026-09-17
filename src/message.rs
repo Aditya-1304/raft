@@ -37,6 +37,10 @@ pub struct RequestVoteResponse {
 pub struct AppendEntriesRequest<C> {
     pub term: Term,
     pub leader_id: NodeId,
+    /// Identifies the leader's current per-follower replication window.
+    /// Followers echo it in the response so delayed messages from a prior
+    /// probe, rewind, or snapshot transition cannot mutate a newer window.
+    pub generation: u64,
     pub prev_log_index: LogIndex,
     pub prev_log_term: Term,
     pub entries: Vec<LogEntry<C>>,
@@ -46,6 +50,7 @@ pub struct AppendEntriesRequest<C> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntriesResponse {
     pub term: Term,
+    pub generation: u64,
     pub success: bool,
     pub match_index: Option<LogIndex>,
     pub conflict_term: Option<Term>,
@@ -56,15 +61,26 @@ pub struct AppendEntriesResponse {
 pub struct InstallSnapshotRequest<S> {
     pub term: Term,
     pub leader_id: NodeId,
+    pub generation: u64,
     pub metadata: SnapshotMetadata,
     pub marker: PhantomData<fn() -> S>,
 }
 
 impl<S> InstallSnapshotRequest<S> {
     pub fn new(term: Term, leader_id: NodeId, metadata: SnapshotMetadata) -> Self {
+        Self::new_with_generation(term, leader_id, metadata, 0)
+    }
+
+    pub fn new_with_generation(
+        term: Term,
+        leader_id: NodeId,
+        metadata: SnapshotMetadata,
+        generation: u64,
+    ) -> Self {
         Self {
             term,
             leader_id,
+            generation,
             metadata,
             marker: PhantomData,
         }
@@ -74,6 +90,7 @@ impl<S> InstallSnapshotRequest<S> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshotResponse {
     pub term: Term,
+    pub generation: u64,
     pub success: bool,
     pub last_included_index: LogIndex,
 }

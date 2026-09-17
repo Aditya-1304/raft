@@ -8,10 +8,10 @@ use std::{
 use raft::{
     core::{node::RaftNode, ready::Ready},
     entry::LogEntry,
-    message::{Envelope, InstallSnapshotRequest, Message},
+    message::{AppendEntriesResponse, Envelope, InstallSnapshotRequest, Message},
     storage::{codec::U64Codec, file::FileSnapshotStore, mem::MemStorage},
     traits::{log_store::LogStore, snapshot_store::SnapshotStore, stable_store::StableStore},
-    types::{ConfState, HardState, Role, Snapshot},
+    types::{ConfState, HardState, ProgressMode, Role, Snapshot},
 };
 
 type TestCmd = u64;
@@ -326,14 +326,15 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
         .collect();
     assert_eq!(to_follower_2.len(), 1);
 
-    match &to_follower_2[0].msg {
+    let stale_generation = match &to_follower_2[0].msg {
         Message::AppendEntries(req) => {
             assert_eq!(req.prev_log_index, 3);
             assert_eq!(req.prev_log_term, 2);
             assert!(req.entries.is_empty());
+            req.generation
         }
         _ => panic!("expected initial AppendEntries heartbeat"),
-    }
+    };
 
     nodes[1].step(to_follower_2.into_iter().next().unwrap());
 
@@ -350,6 +351,34 @@ fn lagging_follower_receives_install_snapshot_when_leader_compacted_prefix() {
     }
 
     nodes[0].step(rejection.into_iter().next().unwrap());
+
+    let snapshot_progress = nodes[0]
+        .progress(raft::types::ReplicaId::must(2))
+        .unwrap()
+        .clone();
+    assert_eq!(snapshot_progress.mode, ProgressMode::Snapshot);
+    assert!(snapshot_progress.generation > stale_generation);
+    assert_eq!(snapshot_progress.inflight_batches, 0);
+
+    nodes[0].step(Envelope {
+        from: raft::types::ReplicaId::must(2),
+        to: raft::types::ReplicaId::must(1),
+        msg: Message::AppendEntriesResponse(AppendEntriesResponse {
+            term: nodes[0].current_term(),
+            generation: stale_generation,
+            success: true,
+            match_index: Some(3),
+            conflict_term: None,
+            conflict_index: None,
+        }),
+    });
+    let progress_after_stale = nodes[0].progress(raft::types::ReplicaId::must(2)).unwrap();
+    assert_eq!(progress_after_stale.mode, ProgressMode::Snapshot);
+    assert_eq!(
+        progress_after_stale.generation,
+        snapshot_progress.generation
+    );
+    assert_eq!(progress_after_stale.inflight_batches, 0);
 
     let snapshot_send = take_messages(&mut nodes[0]);
     assert_eq!(snapshot_send.len(), 1);

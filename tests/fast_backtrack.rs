@@ -69,29 +69,32 @@ fn take_ready(node: &mut TestNode) -> raft::core::ready::Ready<TestCmd, ()> {
     ready
 }
 
-fn flush_cluster(nodes: &mut [TestNode; 3], max_rounds: usize) {
-    for _ in 0..max_rounds {
-        let mut pending = Vec::new();
-
-        for node in nodes.iter_mut() {
-            pending.extend(take_messages(node));
-        }
-
-        if pending.is_empty() {
-            return;
-        }
-
-        deliver(nodes, pending);
-    }
-
-    panic!("cluster did not quiesce within {max_rounds} rounds");
-}
-
 fn elect_leader(nodes: &mut [TestNode; 3], leader_idx: usize) {
     nodes[leader_idx].tick(ELECTION_TIMEOUT);
-    flush_cluster(nodes, 20);
+
+    let prevotes = take_messages(&mut nodes[leader_idx]);
+    deliver(nodes, prevotes);
+
+    let mut prevote_responses = Vec::new();
+    for (idx, node) in nodes.iter_mut().enumerate() {
+        if idx != leader_idx {
+            prevote_responses.extend(take_messages(node));
+        }
+    }
+    deliver(nodes, prevote_responses);
+
+    let vote_requests = take_messages(&mut nodes[leader_idx]);
+    deliver(nodes, vote_requests);
+
+    let mut vote_responses = Vec::new();
+    for (idx, node) in nodes.iter_mut().enumerate() {
+        if idx != leader_idx {
+            vote_responses.extend(take_messages(node));
+        }
+    }
+    deliver(nodes, vote_responses);
+
     assert_eq!(nodes[leader_idx].role(), &Role::Leader);
-    flush_cluster(nodes, 20);
 }
 
 #[test]
@@ -108,6 +111,7 @@ fn follower_reports_conflict_term_and_first_index() {
         msg: Message::AppendEntries(AppendEntriesRequest {
             term: 3,
             leader_id: raft::types::ReplicaId::must(1),
+            generation: 0,
             prev_log_index: 4,
             prev_log_term: 3,
             entries: Vec::new(),
@@ -143,13 +147,19 @@ fn leader_skips_to_end_of_conflict_term_on_rejection() {
     ];
 
     elect_leader(&mut nodes, 0);
+    let _initial_heartbeats = take_messages(&mut nodes[0]);
     let current_term = nodes[0].current_term();
+    let generation = nodes[0]
+        .progress(raft::types::ReplicaId::must(2))
+        .unwrap()
+        .generation;
 
     nodes[0].step(Envelope {
         from: raft::types::ReplicaId::must(2),
         to: raft::types::ReplicaId::must(1),
         msg: Message::AppendEntriesResponse(AppendEntriesResponse {
             term: current_term,
+            generation,
             success: false,
             match_index: None,
             conflict_term: Some(2),

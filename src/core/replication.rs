@@ -31,16 +31,25 @@ where
     }
 
     pub(crate) fn broadcast_heartbeats(&mut self) {
-        let request = AppendEntriesRequest {
-            term: self.current_term(),
-            leader_id: self.id,
-            prev_log_index: self.last_log_index(),
-            prev_log_term: self.last_log_term(),
-            entries: Vec::new(),
-            leader_commit: self.commit_index,
-        };
-
         for peer in self.peers.iter().copied().filter(|peer| *peer != self.id) {
+            let Some(progress) = self
+                .leader_state
+                .as_ref()
+                .and_then(|leader| leader.progress.get(&peer))
+            else {
+                continue;
+            };
+
+            let request = AppendEntriesRequest {
+                term: self.current_term(),
+                leader_id: self.id,
+                generation: progress.generation,
+                prev_log_index: self.last_log_index(),
+                prev_log_term: self.last_log_term(),
+                entries: Vec::new(),
+                leader_commit: self.commit_index,
+            };
+
             self.outbox.push(Envelope {
                 from: self.id,
                 to: peer,
@@ -67,60 +76,91 @@ where
             return;
         }
 
-        let Some(progress) = self
-            .leader_state
-            .as_ref()
-            .and_then(|leader| leader.progress.get(&to))
-            .cloned()
-        else {
-            return;
-        };
-        let next_index = progress.next_index;
+        loop {
+            let Some(progress) = self
+                .leader_state
+                .as_ref()
+                .and_then(|leader| leader.progress.get(&to))
+                .cloned()
+            else {
+                return;
+            };
 
-        if progress.mode == ProgressMode::Snapshot
-            || progress.inflight_batches >= self.limits.max_inflight_append_batches
-            || progress.inflight_bytes >= self.limits.max_inflight_append_bytes
-            || (progress.mode == ProgressMode::Probe && progress.inflight_batches > 0)
-        {
-            return;
-        }
+            if progress.mode == ProgressMode::Snapshot
+                || progress.inflight_batches >= self.limits.max_inflight_append_batches
+                || progress.inflight_bytes >= self.limits.max_inflight_append_bytes
+                || (progress.mode == ProgressMode::Probe && progress.inflight_batches > 0)
+            {
+                return;
+            }
 
-        if self.maybe_send_snapshot_to(to, next_index) {
-            return;
-        }
+            if self.maybe_send_snapshot_to(to, progress.next_index) {
+                return;
+            }
 
-        let prev_log_index = next_index.saturating_sub(1);
-        let prev_log_term = if prev_log_index == 0 {
-            0
-        } else {
-            self.log.term(prev_log_index).unwrap_or(0)
-        };
+            let next_index = progress.next_index;
+            let available_bytes = self
+                .limits
+                .max_inflight_append_bytes
+                .saturating_sub(progress.inflight_bytes);
+            let prev_log_index = next_index.saturating_sub(1);
+            let prev_log_term = if prev_log_index == 0 {
+                0
+            } else {
+                self.log.term(prev_log_index).unwrap_or(0)
+            };
+            let entries = self.bounded_entries(next_index, available_bytes);
+            if entries.is_empty() && next_index <= self.last_log_index() {
+                // The next entry cannot fit in the remaining byte window.
+                // Waiting for an acknowledgment avoids emitting a heartbeat
+                // that could be mistaken for progress on the unsent suffix.
+                return;
+            }
+            let batch_bytes: usize = entries.iter().map(|entry| entry.encoded_len).sum();
+            let end_index = entries.last().map_or(prev_log_index, |entry| entry.index);
+            let request = AppendEntriesRequest {
+                term: self.current_term(),
+                leader_id: self.id,
+                generation: progress.generation,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.commit_index,
+            };
 
-        let entries = self.bounded_entries(next_index);
-        let batch_bytes: usize = entries.iter().map(|entry| entry.encoded_len).sum();
-        let request = AppendEntriesRequest {
-            term: self.current_term(),
-            leader_id: self.id,
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit: self.commit_index,
-        };
+            self.outbox.push(Envelope {
+                from: self.id,
+                to,
+                msg: Message::AppendEntries(request),
+            });
 
-        self.outbox.push(Envelope {
-            from: self.id,
-            to,
-            msg: Message::AppendEntries(request),
-        });
+            if batch_bytes == 0 {
+                return;
+            }
 
-        if batch_bytes > 0
-            && let Some(progress) = self
+            if let Some(progress) = self
                 .leader_state
                 .as_mut()
                 .and_then(|leader| leader.progress.get_mut(&to))
-        {
-            progress.inflight_batches = progress.inflight_batches.saturating_add(1);
-            progress.inflight_bytes = progress.inflight_bytes.saturating_add(batch_bytes);
+            {
+                progress.record_inflight(crate::types::InflightAppend {
+                    generation: progress.generation,
+                    start_index: next_index,
+                    end_index,
+                    bytes: batch_bytes,
+                });
+
+                // Probe remains conservative. Replicate mode advances
+                // optimistically so the next iteration can construct a
+                // distinct range without waiting for the prior response.
+                if progress.mode == ProgressMode::Replicate {
+                    progress.next_index = end_index.saturating_add(1);
+                }
+            }
+
+            if progress.mode == ProgressMode::Probe {
+                return;
+            }
         }
     }
 
@@ -130,7 +170,12 @@ where
         request: AppendEntriesRequest<C>,
     ) -> Result<(), ConfChangeError> {
         if request.term < self.current_term() {
-            self.reject_append_entries(from, None, self.last_log_index().saturating_add(1));
+            self.reject_append_entries(
+                from,
+                request.generation,
+                None,
+                self.last_log_index().saturating_add(1),
+            );
             return Ok(());
         }
 
@@ -140,7 +185,7 @@ where
         if let Err((conflict_term, conflict_index)) =
             self.check_prev_log_match(request.prev_log_index, request.prev_log_term)
         {
-            self.reject_append_entries(from, conflict_term, conflict_index);
+            self.reject_append_entries(from, request.generation, conflict_term, conflict_index);
             return Ok(());
         }
 
@@ -149,7 +194,7 @@ where
         self.follow_leader_commit(request.leader_commit);
 
         let matched_index = request.prev_log_index + request.entries.len() as LogIndex;
-        self.accept_append_entries(from, matched_index);
+        self.accept_append_entries(from, request.generation, matched_index);
         Ok(())
     }
 
@@ -171,10 +216,18 @@ where
             return;
         }
 
-        self.mark_leader_peer_active(from);
-
         let leader_last_index = self.last_log_index();
         let retry_next = self.backtrack_next_index(&response);
+
+        let generation_matches = self
+            .leader_state
+            .as_ref()
+            .and_then(|leader| leader.progress.get(&from))
+            .is_some_and(|progress| response.generation == progress.generation);
+        if !generation_matches {
+            return;
+        }
+        self.mark_leader_peer_active(from);
 
         let should_send_more = {
             let Some(leader_state) = self.leader_state.as_mut() else {
@@ -185,12 +238,13 @@ where
                 return;
             };
 
-            progress.inflight_batches = 0;
-            progress.inflight_bytes = 0;
-
             if response.success {
-                let acknowledged = response.match_index.unwrap_or(progress.match_index);
+                let acknowledged = response
+                    .match_index
+                    .unwrap_or(progress.match_index)
+                    .min(leader_last_index);
                 progress.match_index = progress.match_index.max(acknowledged);
+                progress.acknowledge_through(progress.match_index);
                 progress.next_index = progress
                     .next_index
                     .max(progress.match_index.saturating_add(1));
@@ -199,7 +253,12 @@ where
             } else {
                 let fallback_next = progress.next_index.saturating_sub(1).max(1);
                 let candidate_next = retry_next.unwrap_or(fallback_next).max(1);
-                progress.next_index = progress.next_index.min(candidate_next);
+                let bounded_candidate = candidate_next.min(leader_last_index.saturating_add(1));
+                progress.next_index = progress
+                    .next_index
+                    .min(bounded_candidate)
+                    .max(progress.match_index.saturating_add(1));
+                progress.begin_new_generation();
                 progress.mode = ProgressMode::Probe;
                 true
             }
@@ -221,7 +280,7 @@ where
         request: InstallSnapshotRequest<S>,
     ) {
         if request.term < self.current_term() {
-            self.reject_install_snapshot(from);
+            self.reject_install_snapshot(from, request.generation);
             return;
         }
 
@@ -232,7 +291,7 @@ where
             request.metadata.last_included_index,
             request.metadata.last_included_term,
         ) {
-            self.reject_install_snapshot(from);
+            self.reject_install_snapshot(from, request.generation);
             return;
         }
 
@@ -240,6 +299,7 @@ where
         // and waits for `complete_snapshot_install` before acknowledging.
         self.snapshot_install_source = Some(from);
         self.snapshot_install_expected = Some(request.metadata.clone());
+        self.snapshot_install_generation = Some(request.generation);
         self.pending_snapshot_install = Some(request.metadata);
     }
 
@@ -261,6 +321,14 @@ where
             return;
         }
 
+        let generation_matches = self
+            .leader_state
+            .as_ref()
+            .and_then(|leader| leader.progress.get(&from))
+            .is_some_and(|progress| response.generation == progress.generation);
+        if !generation_matches {
+            return;
+        }
         self.mark_leader_peer_active(from);
 
         let should_send_more = {
@@ -273,18 +341,18 @@ where
             };
 
             if !response.success {
+                progress.begin_new_generation();
                 progress.mode = ProgressMode::Probe;
-                return;
+                true
+            } else {
+                progress.mode = ProgressMode::Probe;
+                progress.begin_new_generation();
+                progress.match_index = progress.match_index.max(response.last_included_index);
+                progress.next_index = progress
+                    .next_index
+                    .max(response.last_included_index.saturating_add(1));
+                progress.next_index <= self.last_log_index()
             }
-
-            progress.mode = ProgressMode::Probe;
-            progress.inflight_batches = 0;
-            progress.inflight_bytes = 0;
-            progress.match_index = progress.match_index.max(response.last_included_index);
-            progress.next_index = progress
-                .next_index
-                .max(response.last_included_index.saturating_add(1));
-            progress.next_index <= self.last_log_index()
         };
 
         self.maybe_advance_commit();
@@ -303,39 +371,41 @@ where
             return false;
         }
 
-        self.outbox.push(Envelope {
-            from: self.id,
-            to,
-            msg: Message::InstallSnapshot(InstallSnapshotRequest::new(
-                self.current_term(),
-                self.id,
-                snapshot.metadata(),
-            )),
-        });
-
-        if let Some(progress) = self
+        let Some(generation) = self
             .leader_state
             .as_mut()
             .and_then(|leader| leader.progress.get_mut(&to))
-        {
-            progress.mode = ProgressMode::Snapshot;
-            progress.inflight_batches = 0;
-            progress.inflight_bytes = 0;
-        }
+            .map(|progress| {
+                progress.mode = ProgressMode::Snapshot;
+                progress.begin_new_generation();
+                progress.generation
+            })
+        else {
+            return false;
+        };
+
+        self.outbox.push(Envelope {
+            from: self.id,
+            to,
+            msg: Message::InstallSnapshot(InstallSnapshotRequest::new_with_generation(
+                self.current_term(),
+                self.id,
+                snapshot.metadata(),
+                generation,
+            )),
+        });
 
         true
     }
 
-    fn bounded_entries(&self, from: LogIndex) -> Vec<LogEntry<C>> {
+    fn bounded_entries(&self, from: LogIndex, max_window_bytes: usize) -> Vec<LogEntry<C>> {
         let candidates = self.log.entries(from, self.limits.max_append_entries);
         let mut bytes = 0_usize;
         let mut bounded = Vec::with_capacity(candidates.len());
 
         for entry in candidates {
             let next_bytes = bytes.saturating_add(entry.encoded_len);
-            if next_bytes > self.limits.max_append_bytes
-                || next_bytes > self.limits.max_inflight_append_bytes
-            {
+            if next_bytes > self.limits.max_append_bytes || next_bytes > max_window_bytes {
                 break;
             }
             bytes = next_bytes;
@@ -344,12 +414,13 @@ where
         bounded
     }
 
-    fn accept_append_entries(&mut self, to: NodeId, match_index: LogIndex) {
+    fn accept_append_entries(&mut self, to: NodeId, generation: u64, match_index: LogIndex) {
         self.outbox.push(Envelope {
             from: self.id,
             to,
             msg: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term(),
+                generation,
                 success: true,
                 match_index: Some(match_index),
                 conflict_term: None,
@@ -361,6 +432,7 @@ where
     fn reject_append_entries(
         &mut self,
         to: NodeId,
+        generation: u64,
         conflict_term: Option<Term>,
         conflict_index: LogIndex,
     ) {
@@ -369,6 +441,7 @@ where
             to,
             msg: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term(),
+                generation,
                 success: false,
                 match_index: None,
                 conflict_term,
@@ -377,24 +450,31 @@ where
         });
     }
 
-    pub(crate) fn accept_install_snapshot(&mut self, to: NodeId, last_included_index: LogIndex) {
+    pub(crate) fn accept_install_snapshot(
+        &mut self,
+        to: NodeId,
+        last_included_index: LogIndex,
+        generation: u64,
+    ) {
         self.outbox.push(Envelope {
             from: self.id,
             to,
             msg: Message::InstallSnapshotResponse(InstallSnapshotResponse {
                 term: self.current_term(),
+                generation,
                 success: true,
                 last_included_index,
             }),
         });
     }
 
-    fn reject_install_snapshot(&mut self, to: NodeId) {
+    fn reject_install_snapshot(&mut self, to: NodeId, generation: u64) {
         self.outbox.push(Envelope {
             from: self.id,
             to,
             msg: Message::InstallSnapshotResponse(InstallSnapshotResponse {
                 term: self.current_term(),
+                generation,
                 success: false,
                 last_included_index: self.first_log_index().saturating_sub(1),
             }),

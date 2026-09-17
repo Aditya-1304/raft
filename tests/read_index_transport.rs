@@ -1,6 +1,10 @@
 use raft::{
     core::read_index::MAX_READ_INDEX_CONTEXT_BYTES,
-    message::{Envelope, Message, ReadIndexRequest, ReadIndexResponse, TimeoutNowRequest},
+    entry::LogEntry,
+    message::{
+        AppendEntriesRequest, AppendEntriesResponse, Envelope, Message, ReadIndexRequest,
+        ReadIndexResponse, TimeoutNowRequest,
+    },
     runtime::transport_tcp::TcpEnvelopeCodec,
     storage::codec::UnitCodec,
     types::NodeId,
@@ -34,6 +38,51 @@ fn read_index_request_and_response_round_trip_through_tcp_codec() {
             term: 7,
             request_id: 42,
             context: b"opaque-read-context".to_vec(),
+        }),
+    };
+
+    assert_eq!(
+        codec
+            .decode_envelope(&codec.encode_envelope(&request).unwrap())
+            .unwrap(),
+        request
+    );
+    assert_eq!(
+        codec
+            .decode_envelope(&codec.encode_envelope(&response).unwrap())
+            .unwrap(),
+        response
+    );
+}
+
+#[test]
+/// Catches a replication wire-format mismatch that would make a valid
+/// response look stale and permanently strand the sender's inflight window.
+fn append_entries_generation_round_trips_through_tcp_codec() {
+    let codec = codec();
+    let request = Envelope {
+        from: NodeId::must(1),
+        to: NodeId::must(2),
+        msg: Message::AppendEntries(AppendEntriesRequest {
+            term: 7,
+            leader_id: NodeId::must(1),
+            generation: 19,
+            prev_log_index: 4,
+            prev_log_term: 3,
+            entries: vec![LogEntry::normal_with_size(5, 7, (), 0)],
+            leader_commit: 4,
+        }),
+    };
+    let response = Envelope {
+        from: NodeId::must(2),
+        to: NodeId::must(1),
+        msg: Message::AppendEntriesResponse(AppendEntriesResponse {
+            term: 7,
+            generation: 19,
+            success: true,
+            match_index: Some(5),
+            conflict_term: None,
+            conflict_index: None,
         }),
     };
 

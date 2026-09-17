@@ -249,6 +249,7 @@ where
     pub(crate) pending_snapshot_install: Option<SnapshotMetadata>,
     pub(crate) snapshot_install_expected: Option<SnapshotMetadata>,
     pub(crate) snapshot_install_source: Option<NodeId>,
+    pub(crate) snapshot_install_generation: Option<u64>,
     pub(crate) latest_snapshot: Option<Snapshot<S>>,
     pub(crate) soft_state_changed: bool,
 
@@ -644,6 +645,7 @@ where
             pending_snapshot_install: None,
             snapshot_install_expected: None,
             snapshot_install_source: None,
+            snapshot_install_generation: None,
             latest_snapshot: None,
             soft_state_changed: false,
             pending_ready: None,
@@ -1128,8 +1130,9 @@ where
         self.stage_snapshot(snapshot);
         self.snapshot_install_source = None;
         self.snapshot_install_expected = None;
+        let generation = self.snapshot_install_generation.take().unwrap_or(0);
         self.pending_snapshot_install = None;
-        self.accept_install_snapshot(from, snapshot_index);
+        self.accept_install_snapshot(from, snapshot_index, generation);
         Ok(())
     }
 
